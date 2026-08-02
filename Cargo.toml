@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bin/boomerang"]
+members = ["bin/boomerang", "crates/database"]
 
 [profile.release]
 strip = true
@@ -18,5 +18,10 @@ opt-level = 3
 codegen-units = 1
 
 [workspace.dependencies]
+chrono = { version = "0.4.45" }
+rust_decimal = { version = "1.42.1" }
+uuid = { version = "1.24.0" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151" }
 # Allocator
 mimalloc = { version = "0.1.52", features = ["secure"] }
