@@ -47,6 +47,12 @@ pub enum ValueType {
     TextArray = 19,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomValue {
+    pub name: Arc<str>,
+    pub value: Box<str>,
+}
+
 pub enum Value {
     Null,
     Bool(bool),
@@ -62,7 +68,7 @@ pub enum Value {
     Date(chrono::NaiveDate),
     Time(chrono::NaiveTime),
     TimeTz(chrono::DateTime<chrono::FixedOffset>),
-    Custom { name: Arc<str>, value: Box<str> },
+    Custom(Box<CustomValue>),
     BoolArray(Box<[bool]>),
     IntArray(Box<[i64]>),
     FloatArray(Box<[f64]>),
@@ -87,7 +93,7 @@ impl Value {
             Value::Date(_) => ValueType::Date,
             Value::Time(_) => ValueType::Time,
             Value::TimeTz(_) => ValueType::TimeTz,
-            Value::Custom { name, .. } => ValueType::Custom(name.clone()),
+            Value::Custom(custom) => ValueType::Custom(custom.name.clone()),
             Value::BoolArray(_) => ValueType::BoolArray,
             Value::IntArray(_) => ValueType::IntArray,
             Value::FloatArray(_) => ValueType::FloatArray,
@@ -111,7 +117,7 @@ impl PartialEq for Value {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
             (Value::Decimal(a), Value::Decimal(b)) => a == b,
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Blob(a), Value::Blob(b)) => a == b,
@@ -122,16 +128,7 @@ impl PartialEq for Value {
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Time(a), Value::Time(b)) => a == b,
             (Value::TimeTz(a), Value::TimeTz(b)) => a == b,
-            (
-                Value::Custom {
-                    name: a,
-                    value: a_value,
-                },
-                Value::Custom {
-                    name: b,
-                    value: b_value,
-                },
-            ) => a == b && a_value == b_value,
+            (Value::Custom(a), Value::Custom(b)) => a == b,
             (Value::BoolArray(a), Value::BoolArray(b)) => a == b,
             (Value::IntArray(a), Value::IntArray(b)) => a == b,
             (Value::FloatArray(a), Value::FloatArray(b)) => a == b,
@@ -230,6 +227,18 @@ impl From<rust_decimal::Decimal> for Value {
     }
 }
 
+impl From<Vec<i64>> for Value {
+    fn from(value: Vec<i64>) -> Self {
+        Value::IntArray(value.into_boxed_slice())
+    }
+}
+
+impl From<Box<[i64]>> for Value {
+    fn from(value: Box<[i64]>) -> Self {
+        Value::IntArray(value)
+    }
+}
+
 macro_rules! impl_int_array {
     ($($t:ty),*) => {
         $(
@@ -259,7 +268,19 @@ macro_rules! impl_int_array {
     };
 }
 
-impl_int_array!(i8, i16, i32, i64, u16, u32);
+impl_int_array!(i8, i16, i32, u16, u32);
+
+impl From<Vec<f64>> for Value {
+    fn from(value: Vec<f64>) -> Self {
+        Value::FloatArray(value.into_boxed_slice())
+    }
+}
+
+impl From<Box<[f64]>> for Value {
+    fn from(value: Box<[f64]>) -> Self {
+        Value::FloatArray(value)
+    }
+}
 
 macro_rules! impl_float_array {
     ($($t:ty),*) => {
@@ -290,7 +311,7 @@ macro_rules! impl_float_array {
     };
 }
 
-impl_float_array!(f32, f64);
+impl_float_array!(f32);
 
 impl From<Vec<bool>> for Value {
     fn from(value: Vec<bool>) -> Self {
@@ -318,10 +339,7 @@ impl From<Box<[rust_decimal::Decimal]>> for Value {
 
 impl From<Vec<String>> for Value {
     fn from(value: Vec<String>) -> Self {
-        let values: Vec<Box<str>> = value
-            .into_iter()
-            .map(String::into_boxed_str)
-            .collect();
+        let values: Vec<Box<str>> = value.into_iter().map(String::into_boxed_str).collect();
 
         Value::TextArray(values.into_boxed_slice())
     }
