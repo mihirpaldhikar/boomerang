@@ -19,7 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-mod value;
 mod string_interner;
+mod symbol_interner;
+mod value;
 
 pub use string_interner::StringInterner;
+pub use symbol_interner::SymbolInterner;
