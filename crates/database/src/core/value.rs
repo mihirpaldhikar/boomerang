@@ -22,7 +22,7 @@
 
 use crate::core::symbol_interner::Symbol;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ValueType {
     Null = 0,
@@ -109,10 +109,6 @@ impl Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
-        if self.kind() != other.kind() {
-            return false;
-        }
-
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
@@ -134,11 +130,7 @@ impl PartialEq for Value {
             (Value::FloatArray(a), Value::FloatArray(b)) => a == b,
             (Value::DecimalArray(a), Value::DecimalArray(b)) => a == b,
             (Value::TextArray(a), Value::TextArray(b)) => a == b,
-            (a, b) => panic!(
-                "Comparison not implemented for {:#?} and {:#?}",
-                a.kind(),
-                b.kind()
-            ),
+            _ => false,
         }
     }
 }
