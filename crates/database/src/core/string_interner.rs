@@ -19,19 +19,22 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use ahash::AHashMap;
+use hashbrown::HashTable;
+use hashbrown::hash_table::Entry;
+use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-const DEFAULT_SHARD_COUNT: usize = 64;
+const DEFAULT_SHARD_COUNT: usize = 16;
 
 pub struct StringInterner {
     shards: Box<[Shard]>,
     hash_builder: ahash::RandomState,
+    shard_shift: u32,
 }
 
 struct Shard {
-    entries: RwLock<AHashMap<Arc<str>, ()>>,
+    entries: RwLock<HashTable<Arc<str>>>,
 }
 
 impl StringInterner {
@@ -40,19 +43,7 @@ impl StringInterner {
     }
 
     pub fn with_shard_count(count: usize) -> Self {
-        let count = count.max(1).next_power_of_two();
-
-        let shards = (0..count)
-            .map(|_| Shard {
-                entries: RwLock::new(AHashMap::new()),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        Self {
-            shards,
-            hash_builder: ahash::RandomState::new(),
-        }
+        Self::with_capacity_and_shards(0, count)
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
@@ -60,12 +51,12 @@ impl StringInterner {
     }
 
     pub fn with_capacity_and_shards(capacity: usize, count: usize) -> Self {
-        let count = count.max(1).next_power_of_two();
+        let count = count.clamp(1, 1 << 16).next_power_of_two();
         let per_shard = capacity.div_ceil(count);
 
         let shards = (0..count)
             .map(|_| Shard {
-                entries: RwLock::new(AHashMap::with_capacity(per_shard)),
+                entries: RwLock::new(HashTable::with_capacity(per_shard)),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -73,6 +64,7 @@ impl StringInterner {
         Self {
             shards,
             hash_builder: ahash::RandomState::new(),
+            shard_shift: 64 - count.trailing_zeros(),
         }
     }
 
@@ -85,55 +77,35 @@ impl StringInterner {
         let shard = self.shard_for_hash(hash);
 
         {
-            let entries = shard.entries.read().expect("read lock poisoned");
+            let entries = shard.entries.read();
 
-            if let Some((existing, _)) = entries.get_key_value(value) {
+            if let Some(existing) = entries.find(hash, |k| &**k == value) {
                 return Arc::clone(existing);
             }
         }
 
-        let mut entries = shard.entries.write().expect("write lock poisoned");
+        let mut entries = shard.entries.write();
 
-        if let Some((existing, _)) = entries.get_key_value(value) {
-            return Arc::clone(existing);
-        }
-
-        let interned: Arc<str> = Arc::from(value);
-        entries.insert(Arc::clone(&interned), ());
-        interned
-    }
-
-    pub fn intern_string(&self, value: String) -> Arc<str> {
-        let hash = self.hash(&value);
-        let shard = self.shard_for_hash(hash);
-
-        {
-            let entries = shard.entries.read().expect("read lock poisoned");
-
-            if let Some((existing, _)) = entries.get_key_value(value.as_str()) {
-                return Arc::clone(existing);
+        match entries.entry(
+            hash,
+            |k| &**k == value,
+            |k| self.hash_builder.hash_one(&**k),
+        ) {
+            Entry::Occupied(entry) => Arc::clone(entry.get()),
+            Entry::Vacant(entry) => {
+                let interned: Arc<str> = Arc::from(value);
+                entry.insert(Arc::clone(&interned));
+                interned
             }
         }
-
-        let mut entries = shard.entries.write().expect("write lock poisoned");
-
-        if let Some((existing, _)) = entries.get_key_value(value.as_str()) {
-            return Arc::clone(existing);
-        }
-
-        let interned: Arc<str> = Arc::from(value.into_boxed_str());
-        entries.insert(Arc::clone(&interned), ());
-        interned
     }
 
     pub fn get(&self, value: &str) -> Option<Arc<str>> {
         let hash = self.hash(value);
         let shard = self.shard_for_hash(hash);
 
-        let entries = shard.entries.read().expect("read lock poisoned");
-        entries
-            .get_key_value(value)
-            .map(|(existing, _)| Arc::clone(existing))
+        let entries = shard.entries.read();
+        entries.find(hash, |k| &**k == value).map(Arc::clone)
     }
 
     pub fn contains(&self, value: &str) -> bool {
@@ -143,14 +115,14 @@ impl StringInterner {
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.entries.read().expect("read lock poisoned").len())
+            .map(|shard| shard.entries.read().len())
             .sum()
     }
 
     pub fn is_empty(&self) -> bool {
         self.shards
             .iter()
-            .all(|shard| shard.entries.read().expect("read lock poisoned").is_empty())
+            .all(|shard| shard.entries.read().is_empty())
     }
 
     pub fn reserve(&self, additional: usize) {
@@ -160,14 +132,31 @@ impl StringInterner {
             shard
                 .entries
                 .write()
-                .expect("write lock poisoned")
-                .reserve(per_shard);
+                .reserve(per_shard, |k| self.hash_builder.hash_one(&**k));
         }
+    }
+
+    pub fn gc(&self) -> usize {
+        let mut removed = 0;
+
+        for shard in self.shards.iter() {
+            let mut entries = shard.entries.write();
+
+            let before = entries.len();
+            entries.retain(|k| Arc::strong_count(k) > 1);
+            removed += before - entries.len();
+
+            if entries.len() < before / 2 {
+                entries.shrink_to_fit(|k| self.hash_builder.hash_one(&**k));
+            }
+        }
+
+        removed
     }
 
     pub fn clear(&self) {
         for shard in self.shards.iter() {
-            shard.entries.write().expect("write lock poisoned").clear();
+            shard.entries.write().clear();
         }
     }
 
@@ -178,7 +167,7 @@ impl StringInterner {
     }
 
     fn shard_for_hash(&self, hash: u64) -> &Shard {
-        let index = hash as usize & (self.shards.len() - 1);
+        let index = (hash >> self.shard_shift) as usize;
         &self.shards[index]
     }
 }
@@ -186,11 +175,5 @@ impl StringInterner {
 impl Default for StringInterner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Drop for StringInterner {
-    fn drop(&mut self) {
-        self.clear();
     }
 }
