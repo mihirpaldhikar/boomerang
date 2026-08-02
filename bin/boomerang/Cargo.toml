@@ -1,0 +1,12 @@
+[package]
+name = "boomerang"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mihir Paldhikar"]
+
+[[bin]]
+name = "boomerang"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc.workspace = true

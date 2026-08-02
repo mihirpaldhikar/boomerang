@@ -1,0 +1,16 @@
+### IDEs
+.idea
+.vscode
+
+### Build Artifacts
+/target
+
+### Logs
+/logs
+
+### Configs
+*.cfg
+*.ini
+
+### Secrets
+*.env.*
