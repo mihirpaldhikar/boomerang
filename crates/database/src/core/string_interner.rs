@@ -65,7 +65,7 @@ impl StringInterner {
 
         let shards = (0..count)
             .map(|_| Shard {
-                entries: RwLock::new(AHashMap::with_capacity(capacity)),
+                entries: RwLock::new(AHashMap::with_capacity(per_shard)),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
