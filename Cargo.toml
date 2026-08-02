@@ -5,7 +5,7 @@ members = ["bin/boomerang", "crates/database"]
 [profile.release]
 strip = true
 lto = true
-opt-level = "s"
+opt-level = 3
 codegen-units = 1
 panic = "abort"
 
@@ -25,4 +25,4 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151" }
 ahash = { version = "0.8.12" }
 # Allocator
-mimalloc = { version = "0.1.52", features = ["secure"] }
+mimalloc = { version = "0.1.52" }
