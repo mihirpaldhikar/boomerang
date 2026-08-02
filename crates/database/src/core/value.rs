@@ -20,9 +20,9 @@
  * SOFTWARE.
  */
 
-use std::sync::Arc;
+use crate::core::symbol_interner::Symbol;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ValueType {
     Null = 0,
@@ -39,7 +39,7 @@ pub enum ValueType {
     Date = 11,
     Time = 12,
     TimeTz = 13,
-    Custom(Arc<str>) = 14,
+    Custom(Symbol) = 14,
     BoolArray = 15,
     IntArray = 16,
     FloatArray = 17,
@@ -49,7 +49,7 @@ pub enum ValueType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomValue {
-    pub name: Arc<str>,
+    pub name: Symbol,
     pub value: Box<str>,
 }
 
@@ -93,7 +93,7 @@ impl Value {
             Value::Date(_) => ValueType::Date,
             Value::Time(_) => ValueType::Time,
             Value::TimeTz(_) => ValueType::TimeTz,
-            Value::Custom(custom) => ValueType::Custom(custom.name.clone()),
+            Value::Custom(custom) => ValueType::Custom(custom.name),
             Value::BoolArray(_) => ValueType::BoolArray,
             Value::IntArray(_) => ValueType::IntArray,
             Value::FloatArray(_) => ValueType::FloatArray,
