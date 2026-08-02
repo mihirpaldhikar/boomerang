@@ -19,5 +19,13 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+use crate::core::StringInterner;
+use std::sync::OnceLock;
 
 mod core;
+
+pub(crate) fn global_column_name_interner() -> &'static StringInterner {
+    static INTERNER: OnceLock<StringInterner> = OnceLock::new();
+
+    INTERNER.get_or_init(|| StringInterner::with_capacity(4096))
+}

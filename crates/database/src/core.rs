@@ -20,3 +20,6 @@
  * SOFTWARE.
  */
 mod value;
+mod string_interner;
+
+pub use string_interner::StringInterner;
