@@ -440,10 +440,17 @@ impl SymbolInterner {
 
         {
             let inner = shard.inner.read();
+            let mut found_text = None;
             if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
-                shard.strings.get(symbol.index()) == Some(value)
+                if let Some(text) = shard.strings.get(symbol.index()) {
+                    if text == value {
+                        found_text = Some(text);
+                        return true;
+                    }
+                }
+                false
             }) {
-                resolved = Some((shard.strings.get(symbol.index()).unwrap(), symbol));
+                resolved = Some((found_text.unwrap(), symbol));
             }
         }
 
