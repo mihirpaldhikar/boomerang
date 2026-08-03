@@ -23,6 +23,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::cell::RefCell;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
@@ -30,6 +31,9 @@ use std::ptr::NonNull;
 const DEFAULT_SHARD_COUNT: usize = 16;
 const MIN_BUCKET_BYTES: usize = 4 * 1024;
 const MAX_BUCKET_BYTES: usize = 256 * 1024;
+const CACHE_CAPACITY: usize = 1024; // MUST be a power of 2
+const _: () = assert!(CACHE_CAPACITY.is_power_of_two());
+const CACHE_MASK: u64 = (CACHE_CAPACITY - 1) as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -167,6 +171,22 @@ struct Shard {
     inner: RwLock<ShardInner>,
 }
 
+struct ThreadLocalCache {
+    entries: [Option<(u64, &'static str, Symbol)>; CACHE_CAPACITY],
+}
+
+impl ThreadLocalCache {
+    fn new() -> Self {
+        Self {
+            entries: [None; CACHE_CAPACITY],
+        }
+    }
+}
+
+thread_local! {
+    static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
+}
+
 pub struct SymbolInterner {
     shards: Box<[Shard]>,
     hash_builder: rustc_hash::FxBuildHasher,
@@ -214,53 +234,112 @@ impl SymbolInterner {
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
         let hash = self.hash_builder.hash_one(value);
+        let cache_index = (hash & CACHE_MASK) as usize;
+
+        let mut hit = None;
+        LOCAL_CACHE.with(|cache| {
+            let cache = cache.borrow();
+
+            if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
+                if cached_hash == hash && cached_value == value {
+                    hit = Some(symbol);
+                }
+            }
+        });
+
+        if let Some(symbol) = hit {
+            return symbol;
+        }
+
         let shard_id = (hash & self.shard_mask) as usize;
         let shard = &self.shards[shard_id];
+
+        let mut resolved = None;
 
         {
             let inner = shard.inner.read();
             if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
                 inner.storage.strings[symbol.index()] == value
             }) {
-                return symbol;
+                resolved = Some((inner.storage.strings[symbol.index()], symbol));
             }
         }
 
-        let mut inner = shard.inner.write();
+        let (text, symbol) = if let Some(res) = resolved {
+            res
+        } else {
+            let mut inner = shard.inner.write();
 
-        let ShardInner { storage, entries } = &mut *inner;
+            let ShardInner { storage, entries } = &mut *inner;
 
-        match entries.entry(
-            hash,
-            |&(_, symbol)| storage.strings[symbol.index()] == value,
-            |&(cached_hash, _)| cached_hash,
-        ) {
-            Entry::Occupied(entry) => entry.get().1,
-            Entry::Vacant(entry) => {
-                let index = storage.strings.len();
-                let text = storage.alloc(value);
-                storage.strings.push(text);
+            match entries.entry(
+                hash,
+                |&(_, symbol)| storage.strings[symbol.index()] == value,
+                |&(cached_hash, _)| cached_hash,
+            ) {
+                Entry::Occupied(entry) => {
+                    let symbol = entry.get().1;
+                    (storage.strings[symbol.index()], symbol)
+                }
+                Entry::Vacant(entry) => {
+                    let index = storage.strings.len();
+                    let text = storage.alloc(value);
+                    storage.strings.push(text);
 
-                let symbol = Symbol::new(shard_id as u8, index);
-                entry.insert((hash, symbol));
-                symbol
+                    let symbol = Symbol::new(shard_id as u8, index);
+                    entry.insert((hash, symbol));
+                    (text, symbol)
+                }
             }
-        }
+        };
+
+        LOCAL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.entries[cache_index] = Some((hash, text, symbol));
+        });
+
+        symbol
     }
 
     pub fn get(&self, value: &str) -> Option<Symbol> {
         let hash = self.hash_builder.hash_one(value);
+        let cache_index = (hash & CACHE_MASK) as usize;
+
+        let mut hit = None;
+        LOCAL_CACHE.with(|cache| {
+            let cache = cache.borrow();
+
+            if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
+                if cached_hash == hash && cached_value == value {
+                    hit = Some(symbol);
+                }
+            }
+        });
+
+        if let Some(symbol) = hit {
+            return Some(symbol);
+        }
+
         let shard_id = (hash & self.shard_mask) as usize;
         let shard = &self.shards[shard_id];
 
         let inner = shard.inner.read();
 
-        inner
+        let symbol = inner
             .entries
             .find(hash, |&(_, symbol)| {
                 inner.storage.strings[symbol.index()] == value
             })
-            .map(|&(_, symbol)| symbol)
+            .map(|&(_, symbol)| symbol)?;
+
+        let text = inner.storage.strings[symbol.index()];
+
+        LOCAL_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.entries[cache_index] = Some((hash, text, symbol));
+        });
+
+        Some(symbol)
     }
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
