@@ -544,9 +544,12 @@ impl SymbolInterner {
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
         let shard_id = symbol.shard_id();
-        let index = symbol.index();
 
-        self.shards.get(shard_id)?.strings.get(index)
+        if shard_id >= self.shards.len() {
+            unsafe { std::hint::unreachable_unchecked() }
+        }
+
+        self.shards[shard_id].strings.get(symbol.index())
     }
 
     pub unsafe fn resolve_unchecked(&self, symbol: Symbol) -> &str {
