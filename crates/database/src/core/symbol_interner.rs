@@ -118,6 +118,12 @@ pub struct SymbolInterner {
     shard_shift: u32,
 }
 
+impl Default for SymbolInterner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolInterner {
     pub fn new() -> Self {
         Self::with_capacity_and_shards(0, DEFAULT_SHARD_COUNT)
@@ -174,6 +180,7 @@ impl SymbolInterner {
                     let index = storage.strings.len();
                     assert!(index < u32::MAX as usize, "SymbolInterner overflow");
                     let text = storage.alloc(value);
+                    storage.strings.push(text);
                     (text, Symbol::from_index(index))
                 };
                 entry.insert(symbol);
@@ -217,8 +224,15 @@ impl SymbolInterner {
     }
 }
 
-impl Default for SymbolInterner {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_interner() {
+        let interner = SymbolInterner::new();
+        interner.intern("hello world");
+        assert_eq!(interner.len(), 1);
+        assert_eq!(interner.is_empty(), false);
     }
 }
