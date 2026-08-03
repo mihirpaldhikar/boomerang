@@ -27,6 +27,7 @@ use std::cell::RefCell;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 const MIN_BUCKET_BYTES: usize = 4 * 1024;
@@ -34,6 +35,15 @@ const MAX_BUCKET_BYTES: usize = 256 * 1024;
 const CACHE_CAPACITY: usize = 1024; // MUST be a power of 2
 const _: () = assert!(CACHE_CAPACITY.is_power_of_two());
 const CACHE_MASK: u64 = (CACHE_CAPACITY - 1) as u64;
+
+const CHUNK_SHIFT: usize = 12;
+const CHUNK_SIZE: usize = 1 << CHUNK_SHIFT;
+const CHUNK_MASK: usize = CHUNK_SIZE - 1;
+
+// A Symbol's index is a 24-bit value (see Symbol::INDEX_MASK), so a shard
+// can hold at most 2^24 strings. The top-level chunk array must therefore
+// cover the full 2^24 index space: 2^24 / CHUNK_SIZE chunks.
+const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -162,15 +172,6 @@ impl Storage {
     }
 }
 
-struct ShardInner {
-    entries: HashTable<(u64, Symbol)>,
-    storage: Storage,
-}
-
-struct Shard {
-    inner: RwLock<ShardInner>,
-}
-
 struct ThreadLocalCache {
     entries: [Option<(u64, &'static str, Symbol)>; CACHE_CAPACITY],
 }
@@ -185,6 +186,129 @@ impl ThreadLocalCache {
 
 thread_local! {
     static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
+}
+
+struct StringChunk {
+    ptrs: [AtomicPtr<u8>; CHUNK_SIZE],
+    lens: [AtomicUsize; CHUNK_SIZE],
+}
+
+impl StringChunk {
+    fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = Layout::new::<StringChunk>();
+            let raw = alloc(layout);
+            let raw = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
+            std::ptr::write_bytes(raw.as_ptr(), 0, layout.size());
+            Box::from_raw(raw.as_ptr() as *mut StringChunk)
+        }
+    }
+}
+
+struct LockFreeStringArray {
+    chunks: Box<[AtomicPtr<StringChunk>]>,
+    len: AtomicUsize,
+}
+
+unsafe impl Send for LockFreeStringArray {}
+unsafe impl Sync for LockFreeStringArray {}
+
+impl LockFreeStringArray {
+    fn new() -> Self {
+        let chunks = (0..NUM_CHUNKS)
+            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Self {
+            chunks,
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&'static str> {
+        if index >= self.len.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let chunk_idx = index >> CHUNK_SHIFT;
+        let slot_idx = index & CHUNK_MASK;
+
+        let chunk_ptr = self.chunks[chunk_idx].load(Ordering::Acquire);
+        if chunk_ptr.is_null() {
+            return None;
+        }
+
+        let chunk = unsafe { &*chunk_ptr };
+
+        let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        let len = chunk.lens[slot_idx].load(Ordering::Relaxed);
+
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            Some(std::str::from_utf8_unchecked(slice))
+        }
+    }
+
+    fn push(&self, value: &'static str) -> usize {
+        let index = self.len.load(Ordering::Relaxed);
+        let chunk_idx = index >> CHUNK_SHIFT;
+        let slot_idx = index & CHUNK_MASK;
+
+        let mut chunk_ptr = self.chunks[chunk_idx].load(Ordering::Acquire);
+        if chunk_ptr.is_null() {
+            let new_chunk = Box::into_raw(StringChunk::new_boxed());
+            match self.chunks[chunk_idx].compare_exchange(
+                std::ptr::null_mut(),
+                new_chunk,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => chunk_ptr = new_chunk,
+                Err(existing) => {
+                    unsafe {
+                        drop(Box::from_raw(new_chunk));
+                    }
+                    chunk_ptr = existing;
+                }
+            }
+        }
+
+        let chunk = unsafe { &*chunk_ptr };
+
+        chunk.lens[slot_idx].store(value.len(), Ordering::Relaxed);
+        chunk.ptrs[slot_idx].store(value.as_ptr() as *mut u8, Ordering::Release);
+
+        self.len.store(index + 1, Ordering::Release);
+
+        index
+    }
+}
+
+impl Drop for LockFreeStringArray {
+    fn drop(&mut self) {
+        for chunk_ptr in self.chunks.iter() {
+            let ptr = chunk_ptr.load(Ordering::Relaxed);
+            if !ptr.is_null() {
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+    }
+}
+
+struct ShardInner {
+    entries: HashTable<(u64, Symbol)>,
+    storage: Storage,
+}
+
+struct Shard {
+    inner: RwLock<ShardInner>,
+    strings: LockFreeStringArray,
 }
 
 pub struct SymbolInterner {
@@ -221,6 +345,7 @@ impl SymbolInterner {
                         strings: Vec::with_capacity(symbols),
                     },
                 }),
+                strings: LockFreeStringArray::new(),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -253,7 +378,6 @@ impl SymbolInterner {
 
         let shard_id = (hash & self.shard_mask) as usize;
         let shard = &self.shards[shard_id];
-
         let mut resolved = None;
 
         {
@@ -270,7 +394,7 @@ impl SymbolInterner {
         } else {
             let mut inner = shard.inner.write();
 
-            let ShardInner { storage, entries } = &mut *inner;
+            let ShardInner { entries, storage } = &mut *inner;
 
             match entries.entry(
                 hash,
@@ -285,6 +409,12 @@ impl SymbolInterner {
                     let index = storage.strings.len();
                     let text = storage.alloc(value);
                     storage.strings.push(text);
+
+                    let lockfree_index = shard.strings.push(text);
+                    assert_eq!(
+                        index, lockfree_index,
+                        "storage.strings and shard.strings must stay in lockstep"
+                    );
 
                     let symbol = Symbol::new(shard_id as u8, index);
                     entry.insert((hash, symbol));
@@ -346,9 +476,7 @@ impl SymbolInterner {
         let shard_id = symbol.shard_id();
         let index = symbol.index();
 
-        let shard = self.shards.get(shard_id)?;
-        let inner = shard.inner.read();
-        inner.storage.strings.get(index).copied()
+        self.shards.get(shard_id)?.strings.get(index)
     }
 
     pub fn contains(&self, value: &str) -> bool {
@@ -370,14 +498,64 @@ impl SymbolInterner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
-    fn test_interner() {
-        let interner = SymbolInterner::with_capacity(10);
+    fn test_symbol_interner() {
+        let interner = SymbolInterner::with_capacity(100);
 
-        interner.get_or_intern("hello");
-        interner.get_or_intern("hello");
+        let a = interner.get_or_intern("hello");
+        let b = interner.get_or_intern("hello");
 
-        assert_eq!(interner.len(), 1)
+        assert_eq!(a, b);
+        assert_eq!(interner.len(), 1);
+        assert_eq!(interner.resolve(a), Some("hello"));
+    }
+
+    #[test]
+    fn test_resolve_lock_free_matches_get() {
+        let interner = SymbolInterner::new();
+        let symbols: Vec<_> = (0..10_000)
+            .map(|i| interner.get_or_intern(&format!("sym-{i}")))
+            .collect();
+
+        for (i, sym) in symbols.iter().enumerate() {
+            assert_eq!(interner.resolve(*sym), Some(format!("sym-{i}").as_str()));
+        }
+    }
+
+    #[test]
+    fn test_concurrent_resolve_while_interning() {
+        let interner = Arc::new(SymbolInterner::new());
+
+        let writer = {
+            let interner = Arc::clone(&interner);
+            thread::spawn(move || {
+                let mut syms = Vec::new();
+                for i in 0..5_000 {
+                    syms.push(interner.get_or_intern(&format!("val-{i}")));
+                }
+                syms
+            })
+        };
+
+        let symbols = writer.join().unwrap();
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let interner = Arc::clone(&interner);
+                let symbols = symbols.clone();
+                thread::spawn(move || {
+                    for (i, sym) in symbols.iter().enumerate() {
+                        assert_eq!(interner.resolve(*sym), Some(format!("val-{i}").as_str()));
+                    }
+                })
+            })
+            .collect();
+
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }
