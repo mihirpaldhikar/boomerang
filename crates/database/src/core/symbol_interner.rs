@@ -22,8 +22,10 @@
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::hash::Hash;
 use std::num::NonZeroU32;
+use std::ptr::NonNull;
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 const MIN_BUCKET_BYTES: usize = 4 * 1024;
@@ -38,7 +40,7 @@ impl Symbol {
     fn from_index(index: usize) -> Self {
         debug_assert!(index < u32::MAX as usize);
 
-        Symbol(unsafe { NonZeroU32::new_unchecked(index as u32 + 1) })
+        Symbol(unsafe { NonZeroU32::new_unchecked((index as u32) + 1) })
     }
 
     #[inline]
@@ -57,13 +59,63 @@ impl Symbol {
     }
 }
 
-struct Shard {
-    entries: RwLock<HashTable<(&'static str, Symbol)>>,
+struct Bucket {
+    ptr: NonNull<u8>,
+    layout: Layout,
+    cursor: usize,
+}
+
+// Safety: Bucket owns its raw memory buffer, so it can be safely shared between threads.
+unsafe impl Send for Bucket {}
+unsafe impl Sync for Bucket {}
+
+impl Bucket {
+    fn new(capacity: usize) -> Self {
+        let layout = Layout::array::<u8>(capacity).expect("valid layout");
+        assert!(capacity > 0, "capacity must be greater than 0");
+
+        let ptr = unsafe { alloc(layout) };
+        let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
+
+        Self {
+            ptr,
+            layout,
+            cursor: 0,
+        }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.layout.size()
+    }
+
+    fn alloc(&mut self, value: &str) -> Option<&'static str> {
+        let len = value.len();
+
+        if self.capacity() - self.cursor < len {
+            return None;
+        }
+
+        unsafe {
+            let destination = self.ptr.as_ptr().add(self.cursor);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), destination, len);
+            self.cursor += len;
+
+            let slice = std::slice::from_raw_parts(destination, len);
+            Some(std::str::from_utf8_unchecked(slice))
+        }
+    }
+}
+
+impl Drop for Bucket {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
+    }
 }
 
 struct Storage {
+    buckets: Vec<Bucket>,
     strings: Vec<&'static str>,
-    buckets: Vec<String>,
 }
 
 impl Storage {
@@ -74,48 +126,40 @@ impl Storage {
             return "";
         }
 
-        let needs_new_bucket = match self.buckets.last() {
-            Some(bucket) => bucket.capacity() - bucket.len() < len,
-            None => true,
-        };
-
-        if needs_new_bucket {
-            let next_cap = self
-                .buckets
-                .last()
-                .map_or(MIN_BUCKET_BYTES, |b| {
-                    (b.capacity() * 2).min(MAX_BUCKET_BYTES)
-                })
-                .max(len);
-
-            self.buckets.push(String::with_capacity(next_cap));
+        if let Some(bucket) = self.buckets.last_mut() {
+            if let Some(text) = bucket.alloc(value) {
+                return text;
+            }
         }
 
-        let bucket = self.buckets.last_mut().expect("bucket just ensured.");
-        let start = bucket.len();
-        bucket.push_str(value);
+        let next_cap = self
+            .buckets
+            .last()
+            .map_or(MIN_BUCKET_BYTES, |bucket| {
+                (bucket.capacity() * 2).min(MAX_BUCKET_BYTES)
+            })
+            .max(len);
 
-        // SAFETY:
-        // The bytes were just written and are valid UTF-8 (copied from &str).
-        // `push_str` cannot have reallocated (capacity was sufficient), and
-        //  this bucket will never be mutated past its capacity nor dropped
-        //  until the interner itself drops, so the pointer is stable.
-        // The 'static lifetime is an internal fiction: every public API
-        //   re-borrows it at `&self`'s lifetime.
-        unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                bucket.as_ptr().add(start),
-                len,
-            ))
-        }
+        let mut new_bucket = Bucket::new(next_cap);
+        let text = new_bucket
+            .alloc(value)
+            .expect("new bucket has enough capacity");
+
+        self.buckets.push(new_bucket);
+
+        text
     }
+}
+
+struct Shard {
+    entries: RwLock<HashTable<(u64, &'static str, Symbol)>>,
 }
 
 pub struct SymbolInterner {
     shards: Box<[Shard]>,
     storage: RwLock<Storage>,
     hash_builder: ahash::RandomState,
-    shard_shift: u32,
+    shard_mask: u64,
 }
 
 impl Default for SymbolInterner {
@@ -147,11 +191,11 @@ impl SymbolInterner {
         Self {
             shards,
             storage: RwLock::new(Storage {
-                strings: Vec::with_capacity(symbols),
                 buckets: Vec::new(),
+                strings: Vec::with_capacity(symbols),
             }),
             hash_builder: ahash::RandomState::new(),
-            shard_shift: 64 - count.trailing_zeros(),
+            shard_mask: (count - 1) as u64,
         }
     }
 
@@ -161,7 +205,7 @@ impl SymbolInterner {
 
         {
             let entries = shard.entries.read();
-            if let Some(&(_, symbol)) = entries.find(hash, |&(text, _)| text == value) {
+            if let Some(&(_, _, symbol)) = entries.find(hash, |&(_, text, _)| text == value) {
                 return symbol;
             }
         }
@@ -170,10 +214,10 @@ impl SymbolInterner {
 
         match entries.entry(
             hash,
-            |&(text, _)| text == value,
-            |&(text, _)| self.hash_builder.hash_one(text),
+            |&(_, text, _)| text == value,
+            |&(cached_hash, _, _)| cached_hash,
         ) {
-            Entry::Occupied(entry) => entry.get().1,
+            Entry::Occupied(entry) => entry.get().2,
             Entry::Vacant(entry) => {
                 let symbol = {
                     let mut storage = self.storage.write();
@@ -183,7 +227,7 @@ impl SymbolInterner {
                     storage.strings.push(text);
                     (text, Symbol::from_index(index))
                 };
-                entry.insert(symbol);
+                entry.insert((hash, symbol.0, symbol.1));
                 symbol.1
             }
         }
@@ -196,13 +240,13 @@ impl SymbolInterner {
         let entries = shard.entries.read();
 
         entries
-            .find(hash, |&(text, _)| text == value)
-            .map(|&(_, symbol)| symbol)
+            .find(hash, |&(_, text, _)| text == value)
+            .map(|&(_, _, symbol)| symbol)
     }
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
         let storage = self.storage.read();
-        storage.strings.get(symbol.index()).map(|&text| text)
+        storage.strings.get(symbol.index()).copied()
     }
 
     pub fn contains(&self, value: &str) -> bool {
@@ -219,7 +263,7 @@ impl SymbolInterner {
 
     #[inline]
     fn shard_for_hash(&self, hash: u64) -> &Shard {
-        let index = (hash >> self.shard_shift) as usize;
+        let index = (hash & self.shard_mask) as usize;
         &self.shards[index]
     }
 }
