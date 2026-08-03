@@ -155,7 +155,7 @@ impl SymbolInterner {
         }
     }
 
-    pub fn intern(&self, value: &str) -> Symbol {
+    pub fn get_or_intern(&self, value: &str) -> Symbol {
         let hash = self.hash_builder.hash_one(value);
         let shard = self.shard_for_hash(hash);
 
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn test_interner() {
         let interner = SymbolInterner::new();
-        interner.intern("hello world");
+        interner.get_or_intern("hello world");
         assert_eq!(interner.len(), 1);
         assert_eq!(interner.is_empty(), false);
     }
