@@ -45,6 +45,8 @@ const CHUNK_MASK: usize = CHUNK_SIZE - 1;
 // cover the full 2^24 index space: 2^24 / CHUNK_SIZE chunks.
 const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
 
+static NEXT_INTERNER_ID: AtomicUsize = AtomicUsize::new(1);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Symbol(NonZeroU32);
@@ -172,7 +174,7 @@ impl Storage {
 }
 
 struct ThreadLocalCache {
-    entries: [Option<(u64, &'static str, Symbol)>; CACHE_CAPACITY],
+    entries: [Option<(usize, u64, &'static str, Symbol)>; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
@@ -185,7 +187,7 @@ impl ThreadLocalCache {
 
 thread_local! {
     static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
-    static LAST_CHUNK: Cell<Option<(usize, usize, *const StringChunk)>> = Cell::new(None);
+    static LAST_CHUNK: Cell<Option<(usize, usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
 struct StringChunk {
@@ -206,6 +208,7 @@ impl StringChunk {
 }
 
 struct LockFreeStringArray {
+    interner_id: usize,
     chunks: Box<[AtomicPtr<StringChunk>]>,
     len: AtomicUsize,
 }
@@ -214,13 +217,14 @@ unsafe impl Send for LockFreeStringArray {}
 unsafe impl Sync for LockFreeStringArray {}
 
 impl LockFreeStringArray {
-    fn new() -> Self {
+    fn new(interner_id: usize) -> Self {
         let chunks = (0..NUM_CHUNKS)
             .map(|_| AtomicPtr::new(std::ptr::null_mut()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
+            interner_id,
             chunks,
             len: AtomicUsize::new(0),
         }
@@ -231,13 +235,17 @@ impl LockFreeStringArray {
         let self_addr = self as *const _ as usize;
 
         LAST_CHUNK.with(|cell| {
-            if let Some((cached_arr, cached_idx, ptr)) = cell.get() {
-                if cached_arr == self_addr && cached_idx == chunk_idx {
+            if let Some((cached_id, cached_addr, cached_idx, ptr)) = cell.get() {
+                if cached_id == self.interner_id
+                    && cached_addr == self_addr
+                    && cached_idx == chunk_idx
+                {
                     return ptr;
                 }
             }
+
             let ptr = self.chunks[chunk_idx].load(Ordering::Acquire) as *const StringChunk;
-            cell.set(Some((self_addr, chunk_idx, ptr)));
+            cell.set(Some((self.interner_id, self_addr, chunk_idx, ptr)));
             ptr
         })
     }
@@ -353,6 +361,7 @@ struct Shard {
 }
 
 pub struct SymbolInterner {
+    interner_id: usize,
     shards: Box<[Shard]>,
     hash_builder: rustc_hash::FxBuildHasher,
     shard_mask: u64,
@@ -374,6 +383,8 @@ impl SymbolInterner {
     }
 
     pub fn with_capacity_and_shards(symbols: usize, count: usize) -> Self {
+        let interner_id = NEXT_INTERNER_ID.fetch_add(1, Ordering::Relaxed);
+
         let count = count.clamp(1, 256).next_power_of_two();
         let per_shard = symbols.div_ceil(count);
 
@@ -385,12 +396,13 @@ impl SymbolInterner {
                         buckets: Vec::new(),
                     },
                 }),
-                strings: LockFreeStringArray::new(),
+                strings: LockFreeStringArray::new(interner_id),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
+            interner_id,
             shards,
             hash_builder: rustc_hash::FxBuildHasher::default(),
             shard_mask: (count - 1) as u64,
@@ -404,8 +416,9 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-            if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
-                if cached_hash == hash && cached_value == value {
+            if let Some((cached_id, cached_hash, cached_value, symbol)) = cache.entries[cache_index]
+            {
+                if cached_id == self.interner_id && cached_hash == hash && cached_value == value {
                     hit = Some(symbol);
                 }
             }
@@ -457,7 +470,7 @@ impl SymbolInterner {
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some((hash, text, symbol));
+            cache.entries[cache_index] = Some((self.interner_id, hash, text, symbol));
         });
 
         symbol
@@ -470,8 +483,9 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-            if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
-                if cached_hash == hash && cached_value == value {
+            if let Some((cached_id, cached_hash, cached_value, symbol)) = cache.entries[cache_index]
+            {
+                if cached_id == self.interner_id && cached_hash == hash && cached_value == value {
                     hit = Some(symbol);
                 }
             }
@@ -497,7 +511,7 @@ impl SymbolInterner {
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some((hash, text, symbol));
+            cache.entries[cache_index] = Some((self.interner_id, hash, text, symbol));
         });
 
         Some(symbol)
@@ -536,19 +550,73 @@ impl SymbolInterner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
     #[test]
-    fn test_symbol_interner() {
+    fn test_symbol_interner_basic() {
         let interner = SymbolInterner::with_capacity(100);
 
         let a = interner.get_or_intern("hello");
         let b = interner.get_or_intern("hello");
+        let c = interner.get_or_intern("world");
+
+        assert_eq!(a, b, "Identical strings should return the same symbol");
+        assert_ne!(a, c, "Different strings should return different symbols");
+        assert_eq!(interner.len(), 2);
+        assert_eq!(interner.resolve(a), Some("hello"));
+        assert_eq!(interner.resolve(c), Some("world"));
+    }
+
+    #[test]
+    fn test_empty_string() {
+        let interner = SymbolInterner::new();
+        let a = interner.get_or_intern("");
+        let b = interner.get_or_intern("");
 
         assert_eq!(a, b);
-        assert_eq!(interner.len(), 1);
-        assert_eq!(interner.resolve(a), Some("hello"));
+        assert_eq!(interner.resolve(a), Some(""));
+    }
+
+    #[test]
+    fn test_unicode_strings() {
+        let interner = SymbolInterner::new();
+        let strings = ["🦀", "你好", "Привет", "こんにちは", "مرحبا"];
+
+        let symbols: Vec<_> = strings.iter().map(|&s| interner.get_or_intern(s)).collect();
+
+        for (i, &s) in strings.iter().enumerate() {
+            assert_eq!(interner.resolve(symbols[i]), Some(s));
+        }
+    }
+
+    #[test]
+    fn test_long_strings() {
+        let interner = SymbolInterner::new();
+        let long_str_1 = "A".repeat(10_000);
+        let long_str_2 = "B".repeat(10_000);
+
+        let sym1 = interner.get_or_intern(&long_str_1);
+        let sym2 = interner.get_or_intern(&long_str_2);
+
+        assert_eq!(interner.resolve(sym1), Some(long_str_1.as_str()));
+        assert_eq!(interner.resolve(sym2), Some(long_str_2.as_str()));
+    }
+
+    #[test]
+    fn test_capacity_growth() {
+        let interner = SymbolInterner::with_capacity(1);
+        let count = 5_000;
+
+        let mut symbols = Vec::with_capacity(count);
+        for i in 0..count {
+            symbols.push(interner.get_or_intern(&format!("grow-{i}")));
+        }
+
+        assert_eq!(interner.len(), count);
+        for (i, &sym) in symbols.iter().enumerate() {
+            assert_eq!(interner.resolve(sym), Some(format!("grow-{i}").as_str()));
+        }
     }
 
     #[test]
@@ -564,55 +632,177 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_resolve_while_interning() {
+    fn test_concurrent_get_or_intern_same_value() {
         let interner = Arc::new(SymbolInterner::new());
+        let num_threads = 16;
+        let barrier = Arc::new(Barrier::new(num_threads));
 
-        let writer = {
-            let interner = Arc::clone(&interner);
-            thread::spawn(move || {
-                let mut syms = Vec::new();
-                for i in 0..5_000 {
-                    syms.push(interner.get_or_intern(&format!("val-{i}")));
-                }
-                syms
-            })
-        };
-
-        let symbols = writer.join().unwrap();
-
-        let readers: Vec<_> = (0..4)
+        let handles: Vec<_> = (0..num_threads)
             .map(|_| {
                 let interner = Arc::clone(&interner);
-                let symbols = symbols.clone();
+                let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
-                    for (i, sym) in symbols.iter().enumerate() {
-                        assert_eq!(interner.resolve(*sym), Some(format!("val-{i}").as_str()));
+                    barrier.wait(); // Maximize contention
+                    interner.get_or_intern("contended")
+                })
+            })
+            .collect();
+
+        let mut symbols = Vec::new();
+        for h in handles {
+            symbols.push(h.join().unwrap());
+        }
+
+        let first = symbols[0];
+        for &sym in &symbols[1..] {
+            assert_eq!(first, sym);
+        }
+        assert_eq!(interner.len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_writers_distinct_values() {
+        let interner = Arc::new(SymbolInterner::new());
+        let num_threads = 8;
+        let items_per_thread = 1_000;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t_id| {
+                let interner = Arc::clone(&interner);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut local_syms = Vec::with_capacity(items_per_thread);
+                    for i in 0..items_per_thread {
+                        let s = format!("thread-{t_id}-item-{i}");
+                        local_syms.push((s.clone(), interner.get_or_intern(&s)));
+                    }
+                    local_syms
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let local_syms = h.join().unwrap();
+            for (string, sym) in local_syms {
+                assert_eq!(interner.resolve(sym), Some(string.as_str()));
+            }
+        }
+
+        assert_eq!(interner.len(), num_threads * items_per_thread);
+    }
+
+    #[test]
+    fn test_multiple_writers_overlapping_values() {
+        let interner = Arc::new(SymbolInterner::new());
+        let num_threads = 8;
+        let items = 1_000;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|_| {
+                let interner = Arc::clone(&interner);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    for i in 0..items {
+                        interner.get_or_intern(&format!("shared-{i}"));
                     }
                 })
             })
             .collect();
 
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(interner.len(), items);
+    }
+
+    #[test]
+    fn test_true_concurrent_resolve_while_interning() {
+        let interner = Arc::new(SymbolInterner::new());
+
+        let pre_interned: Vec<_> = (0..1_000)
+            .map(|i| {
+                let s = format!("pre-val-{i}");
+                (interner.get_or_intern(&s), s)
+            })
+            .collect();
+
+        let barrier = Arc::new(Barrier::new(5));
+
+        let writer = {
+            let interner = Arc::clone(&interner);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for i in 0..5_000 {
+                    interner.get_or_intern(&format!("new-val-{i}"));
+                }
+            })
+        };
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let interner = Arc::clone(&interner);
+                let barrier = Arc::clone(&barrier);
+                let symbols = pre_interned.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..10 {
+                        for (sym, expected_str) in &symbols {
+                            assert_eq!(interner.resolve(*sym), Some(expected_str.as_str()));
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        writer.join().unwrap();
         for r in readers {
             r.join().unwrap();
         }
     }
 
     #[test]
-    fn test_concurrent_get_or_intern_same_value() {
-        let interner = Arc::new(SymbolInterner::new());
-        let handles: Vec<_> = (0..16)
-            .map(|_| {
+    fn test_stress_mixed_workload() {
+        let interner = Arc::new(SymbolInterner::with_capacity(10));
+        let num_threads = 8;
+        let iterations = 2_000;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t_id| {
                 let interner = Arc::clone(&interner);
-                thread::spawn(move || interner.get_or_intern("contended"))
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let mut my_symbols = Vec::new();
+
+                    for i in 0..iterations {
+                        let unique_str = format!("mix-{t_id}-{i}");
+                        let sym = interner.get_or_intern(&unique_str);
+                        my_symbols.push((sym, unique_str));
+
+                        let shared_str = format!("shared-{}", i % 100);
+                        interner.get_or_intern(&shared_str);
+
+                        if i > 0 {
+                            let resolve_idx = i / 2;
+                            let (old_sym, ref old_str) = my_symbols[resolve_idx];
+                            assert_eq!(interner.resolve(old_sym), Some(old_str.as_str()));
+                        }
+                    }
+                })
             })
             .collect();
 
-        let first = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .next()
-            .unwrap();
-        let second = interner.get_or_intern("contended");
-        assert_eq!(first, second);
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(interner.len(), (num_threads * iterations) + 100);
     }
 }
