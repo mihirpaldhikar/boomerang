@@ -23,7 +23,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
@@ -136,7 +136,6 @@ impl Drop for Bucket {
 
 struct Storage {
     buckets: Vec<Bucket>,
-    strings: Vec<&'static str>,
 }
 
 impl Storage {
@@ -186,6 +185,7 @@ impl ThreadLocalCache {
 
 thread_local! {
     static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
+    static LAST_CHUNK: Cell<Option<(usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
 struct StringChunk {
@@ -226,6 +226,22 @@ impl LockFreeStringArray {
         }
     }
 
+    #[inline]
+    fn load_chunk(&self, chunk_idx: usize) -> *const StringChunk {
+        let self_addr = self as *const _ as usize;
+
+        LAST_CHUNK.with(|cell| {
+            if let Some((cached_arr, cached_idx, ptr)) = cell.get() {
+                if cached_arr == self_addr && cached_idx == chunk_idx {
+                    return ptr;
+                }
+            }
+            let ptr = self.chunks[chunk_idx].load(Ordering::Acquire) as *const StringChunk;
+            cell.set(Some((self_addr, chunk_idx, ptr)));
+            ptr
+        })
+    }
+
     fn get(&self, index: usize) -> Option<&'static str> {
         if index >= self.len.load(Ordering::Acquire) {
             return None;
@@ -234,11 +250,24 @@ impl LockFreeStringArray {
         let chunk_idx = index >> CHUNK_SHIFT;
         let slot_idx = index & CHUNK_MASK;
 
-        let chunk_ptr = self.chunks[chunk_idx].load(Ordering::Acquire);
+        let chunk_ptr = self.load_chunk(chunk_idx);
         if chunk_ptr.is_null() {
-            return None;
+            let fresh = self.chunks[chunk_idx].load(Ordering::Acquire);
+            if fresh.is_null() {
+                return None;
+            }
+            return self.get_from_chunk(fresh as *const StringChunk, slot_idx);
         }
 
+        self.get_from_chunk(chunk_ptr, slot_idx)
+    }
+
+    #[inline]
+    fn get_from_chunk(
+        &self,
+        chunk_ptr: *const StringChunk,
+        slot_idx: usize,
+    ) -> Option<&'static str> {
         let chunk = unsafe { &*chunk_ptr };
 
         let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
@@ -251,6 +280,18 @@ impl LockFreeStringArray {
             let slice = std::slice::from_raw_parts(ptr, len);
             Some(std::str::from_utf8_unchecked(slice))
         }
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(&self, index: usize) -> &'static str {
+        let chunk_idx = index >> CHUNK_SHIFT;
+        let slot_idx = index & CHUNK_MASK;
+
+        let chunk_ptr = self.load_chunk(chunk_idx);
+        let chunk = unsafe { &*chunk_ptr };
+        let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
+        let len = chunk.lens[slot_idx].load(Ordering::Relaxed);
+        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
 
     fn push(&self, value: &'static str) -> usize {
@@ -342,7 +383,6 @@ impl SymbolInterner {
                     entries: HashTable::with_capacity(per_shard),
                     storage: Storage {
                         buckets: Vec::new(),
-                        strings: Vec::with_capacity(symbols),
                     },
                 }),
                 strings: LockFreeStringArray::new(),
@@ -364,7 +404,6 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-
             if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
                 if cached_hash == hash && cached_value == value {
                     hit = Some(symbol);
@@ -383,9 +422,9 @@ impl SymbolInterner {
         {
             let inner = shard.inner.read();
             if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
-                inner.storage.strings[symbol.index()] == value
+                shard.strings.get(symbol.index()) == Some(value)
             }) {
-                resolved = Some((inner.storage.strings[symbol.index()], symbol));
+                resolved = Some((shard.strings.get(symbol.index()).unwrap(), symbol));
             }
         }
 
@@ -398,23 +437,16 @@ impl SymbolInterner {
 
             match entries.entry(
                 hash,
-                |&(_, symbol)| storage.strings[symbol.index()] == value,
+                |&(_, symbol)| shard.strings.get(symbol.index()) == Some(value),
                 |&(cached_hash, _)| cached_hash,
             ) {
                 Entry::Occupied(entry) => {
                     let symbol = entry.get().1;
-                    (storage.strings[symbol.index()], symbol)
+                    (shard.strings.get(symbol.index()).unwrap(), symbol)
                 }
                 Entry::Vacant(entry) => {
-                    let index = storage.strings.len();
                     let text = storage.alloc(value);
-                    storage.strings.push(text);
-
-                    let lockfree_index = shard.strings.push(text);
-                    assert_eq!(
-                        index, lockfree_index,
-                        "storage.strings and shard.strings must stay in lockstep"
-                    );
+                    let index = shard.strings.push(text);
 
                     let symbol = Symbol::new(shard_id as u8, index);
                     entry.insert((hash, symbol));
@@ -438,7 +470,6 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-
             if let Some((cached_hash, cached_value, symbol)) = cache.entries[cache_index] {
                 if cached_hash == hash && cached_value == value {
                     hit = Some(symbol);
@@ -458,11 +489,11 @@ impl SymbolInterner {
         let symbol = inner
             .entries
             .find(hash, |&(_, symbol)| {
-                inner.storage.strings[symbol.index()] == value
+                shard.strings.get(symbol.index()) == Some(value)
             })
             .map(|&(_, symbol)| symbol)?;
 
-        let text = inner.storage.strings[symbol.index()];
+        let text = shard.strings.get(symbol.index())?;
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -479,6 +510,13 @@ impl SymbolInterner {
         self.shards.get(shard_id)?.strings.get(index)
     }
 
+    pub unsafe fn resolve_unchecked(&self, symbol: Symbol) -> &str {
+        unsafe {
+            let shard = self.shards.get_unchecked(symbol.shard_id());
+            shard.strings.get_unchecked(symbol.index())
+        }
+    }
+
     pub fn contains(&self, value: &str) -> bool {
         self.get(value).is_some()
     }
@@ -486,7 +524,7 @@ impl SymbolInterner {
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.inner.read().storage.strings.len())
+            .map(|shard| shard.strings.len.load(Ordering::Acquire))
             .sum()
     }
 
@@ -557,5 +595,24 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_concurrent_get_or_intern_same_value() {
+        let interner = Arc::new(SymbolInterner::new());
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let interner = Arc::clone(&interner);
+                thread::spawn(move || interner.get_or_intern("contended"))
+            })
+            .collect();
+
+        let first = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .next()
+            .unwrap();
+        let second = interner.get_or_intern("contended");
+        assert_eq!(first, second);
     }
 }
