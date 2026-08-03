@@ -22,6 +22,7 @@
 mod string_interner;
 mod symbol_interner;
 mod value;
+mod schema;
 
 pub use string_interner::StringInterner;
 pub use symbol_interner::SymbolInterner;
