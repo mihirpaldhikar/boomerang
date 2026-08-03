@@ -23,7 +23,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 
@@ -36,16 +36,23 @@ const MAX_BUCKET_BYTES: usize = 256 * 1024;
 pub struct Symbol(NonZeroU32);
 
 impl Symbol {
-    #[inline]
-    fn from_index(index: usize) -> Self {
-        debug_assert!(index < u32::MAX as usize);
+    const INDEX_MASK: u32 = 0x00FF_FFFF; // Bottom 24 bits.
 
-        Symbol(unsafe { NonZeroU32::new_unchecked((index as u32) + 1) })
+    fn new(shard_id: u8, index: usize) -> Self {
+        assert!(index < Self::INDEX_MASK as usize, "Shard index overflow");
+
+        let raw = ((shard_id as u32) << 24) | ((index as u32) + 1);
+        Symbol(unsafe { NonZeroU32::new_unchecked(raw) })
     }
 
     #[inline]
-    fn index(self) -> usize {
-        (self.0.get() - 1) as usize
+    fn shard_id(&self) -> usize {
+        (self.0.get() >> 24) as usize
+    }
+
+    #[inline]
+    fn index(&self) -> usize {
+        (self.0.get() & Self::INDEX_MASK) as usize - 1
     }
 
     #[inline]
@@ -151,14 +158,18 @@ impl Storage {
     }
 }
 
+struct ShardInner {
+    entries: HashTable<(u64, Symbol)>,
+    storage: Storage,
+}
+
 struct Shard {
-    entries: RwLock<HashTable<(u64, &'static str, Symbol)>>,
+    inner: RwLock<ShardInner>,
 }
 
 pub struct SymbolInterner {
     shards: Box<[Shard]>,
-    storage: RwLock<Storage>,
-    hash_builder: ahash::RandomState,
+    hash_builder: rustc_hash::FxBuildHasher,
     shard_mask: u64,
 }
 
@@ -178,75 +189,87 @@ impl SymbolInterner {
     }
 
     pub fn with_capacity_and_shards(symbols: usize, count: usize) -> Self {
-        let count = count.clamp(1, 1 << 16).next_power_of_two();
+        let count = count.clamp(1, 256).next_power_of_two();
         let per_shard = symbols.div_ceil(count);
 
         let shards = (0..count)
             .map(|_| Shard {
-                entries: RwLock::new(HashTable::with_capacity(per_shard)),
+                inner: RwLock::new(ShardInner {
+                    entries: HashTable::with_capacity(per_shard),
+                    storage: Storage {
+                        buckets: Vec::new(),
+                        strings: Vec::with_capacity(symbols),
+                    },
+                }),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
         Self {
             shards,
-            storage: RwLock::new(Storage {
-                buckets: Vec::new(),
-                strings: Vec::with_capacity(symbols),
-            }),
-            hash_builder: ahash::RandomState::new(),
+            hash_builder: rustc_hash::FxBuildHasher::default(),
             shard_mask: (count - 1) as u64,
         }
     }
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
         let hash = self.hash_builder.hash_one(value);
-        let shard = self.shard_for_hash(hash);
+        let shard_id = (hash & self.shard_mask) as usize;
+        let shard = &self.shards[shard_id];
 
         {
-            let entries = shard.entries.read();
-            if let Some(&(_, _, symbol)) = entries.find(hash, |&(_, text, _)| text == value) {
+            let inner = shard.inner.read();
+            if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
+                inner.storage.strings[symbol.index()] == value
+            }) {
                 return symbol;
             }
         }
 
-        let mut entries = shard.entries.write();
+        let mut inner = shard.inner.write();
+
+        let ShardInner { storage, entries } = &mut *inner;
 
         match entries.entry(
             hash,
-            |&(_, text, _)| text == value,
-            |&(cached_hash, _, _)| cached_hash,
+            |&(_, symbol)| storage.strings[symbol.index()] == value,
+            |&(cached_hash, _)| cached_hash,
         ) {
-            Entry::Occupied(entry) => entry.get().2,
+            Entry::Occupied(entry) => entry.get().1,
             Entry::Vacant(entry) => {
-                let symbol = {
-                    let mut storage = self.storage.write();
-                    let index = storage.strings.len();
-                    assert!(index < u32::MAX as usize, "SymbolInterner overflow");
-                    let text = storage.alloc(value);
-                    storage.strings.push(text);
-                    (text, Symbol::from_index(index))
-                };
-                entry.insert((hash, symbol.0, symbol.1));
-                symbol.1
+                let index = storage.strings.len();
+                let text = storage.alloc(value);
+                storage.strings.push(text);
+
+                let symbol = Symbol::new(shard_id as u8, index);
+                entry.insert((hash, symbol));
+                symbol
             }
         }
     }
 
     pub fn get(&self, value: &str) -> Option<Symbol> {
         let hash = self.hash_builder.hash_one(value);
-        let shard = self.shard_for_hash(hash);
+        let shard_id = (hash & self.shard_mask) as usize;
+        let shard = &self.shards[shard_id];
 
-        let entries = shard.entries.read();
+        let inner = shard.inner.read();
 
-        entries
-            .find(hash, |&(_, text, _)| text == value)
-            .map(|&(_, _, symbol)| symbol)
+        inner
+            .entries
+            .find(hash, |&(_, symbol)| {
+                inner.storage.strings[symbol.index()] == value
+            })
+            .map(|&(_, symbol)| symbol)
     }
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
-        let storage = self.storage.read();
-        storage.strings.get(symbol.index()).copied()
+        let shard_id = symbol.shard_id();
+        let index = symbol.index();
+
+        let shard = self.shards.get(shard_id)?;
+        let inner = shard.inner.read();
+        inner.storage.strings.get(index).copied()
     }
 
     pub fn contains(&self, value: &str) -> bool {
@@ -254,17 +277,14 @@ impl SymbolInterner {
     }
 
     pub fn len(&self) -> usize {
-        self.storage.read().strings.len()
+        self.shards
+            .iter()
+            .map(|shard| shard.inner.read().storage.strings.len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.storage.read().strings.is_empty()
-    }
-
-    #[inline]
-    fn shard_for_hash(&self, hash: u64) -> &Shard {
-        let index = (hash & self.shard_mask) as usize;
-        &self.shards[index]
+        self.len() == 0
     }
 }
 
@@ -274,9 +294,11 @@ mod tests {
 
     #[test]
     fn test_interner() {
-        let interner = SymbolInterner::new();
-        interner.get_or_intern("hello world");
-        assert_eq!(interner.len(), 1);
-        assert_eq!(interner.is_empty(), false);
+        let interner = SymbolInterner::with_capacity(10);
+
+        interner.get_or_intern("hello");
+        interner.get_or_intern("hello");
+
+        assert_eq!(interner.len(), 1)
     }
 }
