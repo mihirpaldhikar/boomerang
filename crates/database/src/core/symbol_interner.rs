@@ -115,16 +115,21 @@ impl Bucket {
     fn alloc(&mut self, value: &str) -> Option<&'static str> {
         let len = value.len();
 
-        if self.capacity() - self.cursor < len {
+        if self.capacity() - self.cursor < len + 4 {
             return None;
         }
 
         unsafe {
-            let destination = self.ptr.as_ptr().add(self.cursor);
-            std::ptr::copy_nonoverlapping(value.as_ptr(), destination, len);
-            self.cursor += len;
+            let start = self.ptr.as_ptr().add(self.cursor);
 
-            let slice = std::slice::from_raw_parts(destination, len);
+            std::ptr::write_unaligned(start as *mut u32, len as u32);
+
+            let string_start = start.add(4);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), string_start, len);
+
+            self.cursor += len + 4;
+
+            let slice = std::slice::from_raw_parts(string_start, len);
             Some(std::str::from_utf8_unchecked(slice))
         }
     }
@@ -144,10 +149,6 @@ impl Storage {
     fn alloc(&mut self, value: &str) -> &'static str {
         let len = value.len();
 
-        if len == 0 {
-            return "";
-        }
-
         if let Some(bucket) = self.buckets.last_mut() {
             if let Some(text) = bucket.alloc(value) {
                 return text;
@@ -160,7 +161,7 @@ impl Storage {
             .map_or(MIN_BUCKET_BYTES, |bucket| {
                 (bucket.capacity() * 2).min(MAX_BUCKET_BYTES)
             })
-            .max(len);
+            .max(len + 4);
 
         let mut new_bucket = Bucket::new(next_cap);
         let text = new_bucket
@@ -192,7 +193,6 @@ thread_local! {
 
 struct StringChunk {
     ptrs: [AtomicPtr<u8>; CHUNK_SIZE],
-    lens: [AtomicUsize; CHUNK_SIZE],
 }
 
 impl StringChunk {
@@ -201,7 +201,9 @@ impl StringChunk {
             let layout = Layout::new::<StringChunk>();
             let raw = alloc(layout);
             let raw = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
+
             std::ptr::write_bytes(raw.as_ptr(), 0, layout.size());
+
             Box::from_raw(raw.as_ptr() as *mut StringChunk)
         }
     }
@@ -282,7 +284,8 @@ impl LockFreeStringArray {
         if ptr.is_null() {
             return None;
         }
-        let len = chunk.lens[slot_idx].load(Ordering::Relaxed);
+
+        let len = unsafe { std::ptr::read_unaligned(ptr.sub(4) as *const u32) as usize };
 
         unsafe {
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -298,7 +301,9 @@ impl LockFreeStringArray {
         let chunk_ptr = self.load_chunk(chunk_idx);
         let chunk = unsafe { &*chunk_ptr };
         let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
-        let len = chunk.lens[slot_idx].load(Ordering::Relaxed);
+
+        let len = unsafe { std::ptr::read_unaligned(ptr.sub(4) as *const u32) as usize };
+
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
     }
 
@@ -328,7 +333,6 @@ impl LockFreeStringArray {
 
         let chunk = unsafe { &*chunk_ptr };
 
-        chunk.lens[slot_idx].store(value.len(), Ordering::Relaxed);
         chunk.ptrs[slot_idx].store(value.as_ptr() as *mut u8, Ordering::Release);
 
         self.len.store(index + 1, Ordering::Release);
