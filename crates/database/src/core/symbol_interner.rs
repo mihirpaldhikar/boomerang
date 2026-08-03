@@ -174,7 +174,7 @@ impl Storage {
 }
 
 struct ThreadLocalCache {
-    entries: [Option<(usize, u64, &'static str, Symbol)>; CACHE_CAPACITY],
+    entries: [Option<(usize, u64, *const u8, usize, Symbol)>; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
@@ -416,10 +416,16 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-            if let Some((cached_id, cached_hash, cached_value, symbol)) = cache.entries[cache_index]
-            {
-                if cached_id == self.interner_id && cached_hash == hash && cached_value == value {
-                    hit = Some(symbol);
+            if let Some((cached_id, cached_hash, ptr, len, symbol)) = cache.entries[cache_index] {
+                if cached_id == self.interner_id && cached_hash == hash {
+                    let cached_value = unsafe {
+                        let slice = std::slice::from_raw_parts(ptr, len);
+                        std::str::from_utf8_unchecked(slice)
+                    };
+
+                    if cached_value == value {
+                        hit = Some(symbol);
+                    }
                 }
             }
         });
@@ -470,7 +476,8 @@ impl SymbolInterner {
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some((self.interner_id, hash, text, symbol));
+            cache.entries[cache_index] =
+                Some((self.interner_id, hash, text.as_ptr(), text.len(), symbol));
         });
 
         symbol
@@ -483,10 +490,16 @@ impl SymbolInterner {
         let mut hit = None;
         LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-            if let Some((cached_id, cached_hash, cached_value, symbol)) = cache.entries[cache_index]
-            {
-                if cached_id == self.interner_id && cached_hash == hash && cached_value == value {
-                    hit = Some(symbol);
+            if let Some((cached_id, cached_hash, ptr, len, symbol)) = cache.entries[cache_index] {
+                if cached_id == self.interner_id && cached_hash == hash {
+                    let cached_value = unsafe {
+                        let slice = std::slice::from_raw_parts(ptr, len);
+                        std::str::from_utf8_unchecked(slice)
+                    };
+
+                    if cached_value == value {
+                        hit = Some(symbol);
+                    }
                 }
             }
         });
@@ -511,7 +524,8 @@ impl SymbolInterner {
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some((self.interner_id, hash, text, symbol));
+            cache.entries[cache_index] =
+                Some((self.interner_id, hash, text.as_ptr(), text.len(), symbol));
         });
 
         Some(symbol)
