@@ -135,6 +135,12 @@ impl MemoryPool {
 
         offset
     }
+
+    #[inline]
+    pub fn committed_bytes(&self) -> &[u8] {
+        let current_cursor = self.cursor.load(Ordering::Acquire) as usize;
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), current_cursor) }
+    }
 }
 
 impl Drop for MemoryPool {
@@ -389,6 +395,74 @@ impl SymbolInterner {
             hash_builder: rustc_hash::FxBuildHasher::default(),
             shard_mask: (count - 1) as u64,
         }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.pool.committed_bytes()
+    }
+
+    pub fn offset_of(&self, symbol: Symbol) -> Option<u32> {
+        let shard_id = symbol.shard_id();
+        if shard_id >= self.shards.len() {
+            return None;
+        }
+
+        let chunk_idx = symbol.index() >> CHUNK_SHIFT;
+        let slot_idx = symbol.index() & CHUNK_MASK;
+
+        let chunk_ptr = self.shards[shard_id].strings.load_chunk(chunk_idx);
+        if chunk_ptr.is_null() {
+            return None;
+        }
+
+        let offset = unsafe { (*chunk_ptr).offsets[slot_idx].load(Ordering::Acquire) };
+        if offset == 0 { None } else { Some(offset) }
+    }
+
+    pub fn resolve_raw_offset(bytes: &[u8], offset: u32) -> Option<&str> {
+        let offset = offset as usize;
+
+        if offset == 0 || offset + 4 > bytes.len() {
+            return None;
+        }
+
+        let len_bytes: [u8; 4] = bytes[offset..offset + 4].try_into().ok()?;
+        let len = u32::from_ne_bytes(len_bytes) as usize;
+
+        if offset + 4 + len > bytes.len() {
+            return None;
+        }
+
+        std::str::from_utf8(&bytes[offset + 4..offset + 4 + len]).ok()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let estimated_symbols = bytes.len() / 16;
+        let interner = Self::with_capacity(estimated_symbols);
+
+        if bytes.len() <= 4 {
+            return interner;
+        }
+
+        let mut cursor = 4;
+
+        while cursor + 4 <= bytes.len() {
+            let len_bytes: [u8; 4] = bytes[cursor..cursor + 4].try_into().unwrap();
+            let len = u32::from_ne_bytes(len_bytes) as usize;
+
+            if cursor + 4 + len > bytes.len() {
+                break;
+            }
+
+            let str_slice = &bytes[cursor + 4..cursor + 4 + len];
+            if let Ok(text) = std::str::from_utf8(str_slice) {
+                interner.get_or_intern(text);
+            }
+
+            cursor += 4 + len;
+        }
+
+        interner
     }
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
