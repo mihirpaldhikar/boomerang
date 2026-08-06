@@ -30,11 +30,9 @@ use std::cell::{Cell, RefCell};
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
-const MIN_BUCKET_BYTES: usize = 4 * 1024;
-const MAX_BUCKET_BYTES: usize = 256 * 1024;
 const CACHE_CAPACITY: usize = 1024; // MUST be a power of 2
 const _: () = assert!(CACHE_CAPACITY.is_power_of_two());
 const CACHE_MASK: u64 = (CACHE_CAPACITY - 1) as u64;
@@ -47,6 +45,9 @@ const CHUNK_MASK: usize = CHUNK_SIZE - 1;
 // can hold at most 2^24 strings. The top-level chunk array must therefore
 // cover the full 2^24 index space: 2^24 / CHUNK_SIZE chunks.
 const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
+
+// Default Arena Capacity: 256 MB.
+const ARENA_CAPACITY: u32 = 256 * 1024 * 1024;
 
 static NEXT_INTERNER_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -85,102 +86,67 @@ impl Symbol {
     }
 }
 
-struct Bucket {
+struct MemoryPool {
     ptr: NonNull<u8>,
+    cursor: AtomicU32,
+    capacity: u32,
     layout: Layout,
-    cursor: usize,
 }
 
-// Safety: Bucket owns its raw memory buffer, so it can be safely shared between threads.
-unsafe impl Send for Bucket {}
-unsafe impl Sync for Bucket {}
+unsafe impl Send for MemoryPool {}
+unsafe impl Sync for MemoryPool {}
 
-impl Bucket {
-    fn new(capacity: usize) -> Self {
-        let layout = Layout::array::<u8>(capacity).expect("valid layout");
-        assert!(capacity > 0, "capacity must be greater than 0");
+impl MemoryPool {
+    fn new(capacity: u32) -> Self {
+        let layout = Layout::array::<u8>(capacity as usize).expect("valid layout");
 
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
 
         Self {
             ptr,
+            cursor: AtomicU32::new(4),
+            capacity,
             layout,
-            cursor: 0,
         }
     }
 
     #[inline]
-    fn capacity(&self) -> usize {
-        self.layout.size()
+    fn base_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr() as *const u8
     }
 
-    fn alloc(&mut self, value: &str) -> Option<&'static str> {
-        let len = value.len();
+    #[inline]
+    fn alloc(&self, value: &str) -> u32 {
+        let len = value.len() as u32;
+        let size = len + 4;
 
-        if self.capacity() - self.cursor < len + 4 {
-            return None;
+        let offset = self.cursor.fetch_add(size, Ordering::Relaxed);
+
+        if offset + size > self.capacity {
+            panic!("Arena out of memory");
         }
 
         unsafe {
-            let start = self.ptr.as_ptr().add(self.cursor);
-
-            std::ptr::write_unaligned(start as *mut u32, len as u32);
-
-            let string_start = start.add(4);
-            std::ptr::copy_nonoverlapping(value.as_ptr(), string_start, len);
-
-            self.cursor += len + 4;
-
-            let slice = std::slice::from_raw_parts(string_start, len);
-            Some(std::str::from_utf8_unchecked(slice))
+            let start = self.ptr.as_ptr().add(offset as usize);
+            std::ptr::write_unaligned(start as *mut u32, len);
+            std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
         }
+
+        offset
     }
 }
 
-impl Drop for Bucket {
+impl Drop for MemoryPool {
     fn drop(&mut self) {
         unsafe { dealloc(self.ptr.as_ptr(), self.layout) }
-    }
-}
-
-struct Storage {
-    buckets: Vec<Bucket>,
-}
-
-impl Storage {
-    fn alloc(&mut self, value: &str) -> &'static str {
-        let len = value.len();
-
-        if let Some(bucket) = self.buckets.last_mut() {
-            if let Some(text) = bucket.alloc(value) {
-                return text;
-            }
-        }
-
-        let next_cap = self
-            .buckets
-            .last()
-            .map_or(MIN_BUCKET_BYTES, |bucket| {
-                (bucket.capacity() * 2).min(MAX_BUCKET_BYTES)
-            })
-            .max(len + 4);
-
-        let mut new_bucket = Bucket::new(next_cap);
-        let text = new_bucket
-            .alloc(value)
-            .expect("new bucket has enough capacity");
-
-        self.buckets.push(new_bucket);
-
-        text
     }
 }
 
 #[derive(Clone, Copy)]
 struct CacheEntry {
     interner_id: usize,
-    ptr: *const u8,
+    offset: u32,
     hash: u32,
     symbol: Symbol,
 }
@@ -203,7 +169,7 @@ thread_local! {
 }
 
 struct StringChunk {
-    ptrs: [AtomicPtr<u8>; CHUNK_SIZE],
+    offsets: [AtomicU32; CHUNK_SIZE],
 }
 
 impl StringChunk {
@@ -263,7 +229,7 @@ impl LockFreeStringArray {
         })
     }
 
-    fn get(&self, index: usize) -> Option<&'static str> {
+    fn get(&self, index: usize, base_ptr: *const u8) -> Option<&'static str> {
         if index >= self.len.load(Ordering::Acquire) {
             return None;
         }
@@ -277,10 +243,10 @@ impl LockFreeStringArray {
             if fresh.is_null() {
                 return None;
             }
-            return self.get_from_chunk(fresh as *const StringChunk, slot_idx);
+            return self.get_from_chunk(fresh as *const StringChunk, slot_idx, base_ptr);
         }
 
-        self.get_from_chunk(chunk_ptr, slot_idx)
+        self.get_from_chunk(chunk_ptr, slot_idx, base_ptr)
     }
 
     #[inline]
@@ -288,37 +254,41 @@ impl LockFreeStringArray {
         &self,
         chunk_ptr: *const StringChunk,
         slot_idx: usize,
+        base_ptr: *const u8,
     ) -> Option<&'static str> {
         let chunk = unsafe { &*chunk_ptr };
 
-        let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
-        if ptr.is_null() {
+        let offset = chunk.offsets[slot_idx].load(Ordering::Acquire);
+        if offset == 0 {
             return None;
         }
 
-        let len = unsafe { std::ptr::read_unaligned(ptr.sub(4) as *const u32) as usize };
-
         unsafe {
-            let slice = std::slice::from_raw_parts(ptr, len);
+            let ptr = base_ptr.add(offset as usize);
+            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+            let slice = std::slice::from_raw_parts(ptr.add(4), len);
             Some(std::str::from_utf8_unchecked(slice))
         }
     }
 
     #[inline]
-    unsafe fn get_unchecked(&self, index: usize) -> &'static str {
+    unsafe fn get_unchecked(&self, index: usize, base_ptr: *const u8) -> &'static str {
         let chunk_idx = index >> CHUNK_SHIFT;
         let slot_idx = index & CHUNK_MASK;
 
         let chunk_ptr = self.load_chunk(chunk_idx);
         let chunk = unsafe { &*chunk_ptr };
-        let ptr = chunk.ptrs[slot_idx].load(Ordering::Acquire);
 
-        let len = unsafe { std::ptr::read_unaligned(ptr.sub(4) as *const u32) as usize };
+        let offset = chunk.offsets[slot_idx].load(Ordering::Acquire);
+        unsafe {
+            let ptr = base_ptr.add(offset as usize);
+            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
 
-        unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) }
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
+        }
     }
 
-    fn push(&self, value: &'static str) -> usize {
+    fn push(&self, offset: u32) -> usize {
         let index = self.len.load(Ordering::Relaxed);
         let chunk_idx = index >> CHUNK_SHIFT;
         let slot_idx = index & CHUNK_MASK;
@@ -344,8 +314,7 @@ impl LockFreeStringArray {
 
         let chunk = unsafe { &*chunk_ptr };
 
-        chunk.ptrs[slot_idx].store(value.as_ptr() as *mut u8, Ordering::Release);
-
+        chunk.offsets[slot_idx].store(offset, Ordering::Release);
         self.len.store(index + 1, Ordering::Release);
 
         index
@@ -367,7 +336,6 @@ impl Drop for LockFreeStringArray {
 
 struct ShardInner {
     entries: HashTable<(u64, Symbol)>,
-    storage: Storage,
 }
 
 struct Shard {
@@ -377,6 +345,7 @@ struct Shard {
 
 pub struct SymbolInterner {
     interner_id: usize,
+    pool: MemoryPool,
     shards: Box<[Shard]>,
     hash_builder: rustc_hash::FxBuildHasher,
     shard_mask: u64,
@@ -407,9 +376,6 @@ impl SymbolInterner {
             .map(|_| Shard {
                 inner: RwLock::new(ShardInner {
                     entries: HashTable::with_capacity(per_shard),
-                    storage: Storage {
-                        buckets: Vec::new(),
-                    },
                 }),
                 strings: LockFreeStringArray::new(interner_id),
             })
@@ -418,6 +384,7 @@ impl SymbolInterner {
 
         Self {
             interner_id,
+            pool: MemoryPool::new(ARENA_CAPACITY),
             shards,
             hash_builder: rustc_hash::FxBuildHasher::default(),
             shard_mask: (count - 1) as u64,
@@ -434,11 +401,10 @@ impl SymbolInterner {
             let cache = cache.borrow();
             if let Some(entry) = cache.entries[cache_index] {
                 if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                    let len = unsafe {
-                        std::ptr::read_unaligned(entry.ptr.sub(4) as *const u32) as usize
-                    };
+                    let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
+                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
                     let cached_value = unsafe {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(entry.ptr, len))
+                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
                     };
 
                     if cached_value == value {
@@ -461,7 +427,7 @@ impl SymbolInterner {
             let mut found_text = None;
 
             if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
-                if let Some(text) = shard.strings.get(symbol.index()) {
+                if let Some(text) = shard.strings.get(symbol.index(), self.pool.base_ptr()) {
                     if text == value {
                         found_text = Some(text);
                         return true;
@@ -478,33 +444,46 @@ impl SymbolInterner {
         } else {
             let mut inner = shard.inner.write();
 
-            let ShardInner { entries, storage } = &mut *inner;
-
-            match entries.entry(
+            match inner.entries.entry(
                 hash,
-                |&(_, symbol)| shard.strings.get(symbol.index()) == Some(value),
+                |&(_, symbol)| {
+                    shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
+                },
                 |&(cached_hash, _)| cached_hash,
             ) {
                 Entry::Occupied(entry) => {
                     let symbol = entry.get().1;
-                    (shard.strings.get(symbol.index()).unwrap(), symbol)
+                    (
+                        shard
+                            .strings
+                            .get(symbol.index(), self.pool.base_ptr())
+                            .unwrap(),
+                        symbol,
+                    )
                 }
                 Entry::Vacant(entry) => {
-                    let text = storage.alloc(value);
-                    let index = shard.strings.push(text);
+                    let offset = self.pool.alloc(value);
+
+                    let index = shard.strings.push(offset);
 
                     let symbol = Symbol::new(shard_id as u8, index);
                     entry.insert((hash, symbol));
-                    (text, symbol)
+
+                    let ptr = unsafe { self.pool.base_ptr().add(offset as usize) };
+                    let len = value.len();
+                    let slice = unsafe { std::slice::from_raw_parts(ptr.add(4), len) };
+                    (unsafe { std::str::from_utf8_unchecked(slice) }, symbol)
                 }
             }
         };
+
+        let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             cache.entries[cache_index] = Some(CacheEntry {
                 interner_id: self.interner_id,
-                ptr: text.as_ptr(),
+                offset,
                 hash: hash_trunc,
                 symbol,
             });
@@ -523,11 +502,10 @@ impl SymbolInterner {
             let cache = cache.borrow();
             if let Some(entry) = cache.entries[cache_index] {
                 if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                    let len = unsafe {
-                        std::ptr::read_unaligned(entry.ptr.sub(4) as *const u32) as usize
-                    };
+                    let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
+                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
                     let cached_value = unsafe {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(entry.ptr, len))
+                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
                     };
 
                     if cached_value == value {
@@ -549,17 +527,19 @@ impl SymbolInterner {
         let symbol = inner
             .entries
             .find(hash, |&(_, symbol)| {
-                shard.strings.get(symbol.index()) == Some(value)
+                shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
             })
             .map(|&(_, symbol)| symbol)?;
 
-        let text = shard.strings.get(symbol.index())?;
+        let text = shard.strings.get(symbol.index(), self.pool.base_ptr())?;
+
+        let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
         LOCAL_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             cache.entries[cache_index] = Some(CacheEntry {
                 interner_id: self.interner_id,
-                ptr: text.as_ptr(),
+                offset,
                 hash: hash_trunc,
                 symbol,
             });
@@ -570,18 +550,20 @@ impl SymbolInterner {
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
         let shard_id = symbol.shard_id();
-
         if shard_id >= self.shards.len() {
             unsafe { std::hint::unreachable_unchecked() }
         }
-
-        self.shards[shard_id].strings.get(symbol.index())
+        self.shards[shard_id]
+            .strings
+            .get(symbol.index(), self.pool.base_ptr())
     }
 
     pub unsafe fn resolve_unchecked(&self, symbol: Symbol) -> &str {
         unsafe {
             let shard = self.shards.get_unchecked(symbol.shard_id());
-            shard.strings.get_unchecked(symbol.index())
+            shard
+                .strings
+                .get_unchecked(symbol.index(), self.pool.base_ptr())
         }
     }
 
