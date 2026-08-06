@@ -98,16 +98,13 @@ unsafe impl Send for MemoryPool {}
 unsafe impl Sync for MemoryPool {}
 
 impl MemoryPool {
-    fn new(capacity: u32) -> Self {
+    fn new(capacity: u32, shard_count: u32) -> Self {
         let layout = Layout::array::<u8>(capacity as usize).expect("valid layout");
 
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
 
-        // Bytes [0, 4) are reserved (offset 0 doubles as the "empty" sentinel
-        // in StringChunk::offsets) but are otherwise never written. Zero them
-        // explicitly so `committed_bytes()` never exposes uninitialized memory.
-        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, 4) };
+        unsafe { std::ptr::write_unaligned(ptr.as_ptr() as *mut u32, shard_count) };
 
         Self {
             ptr,
@@ -157,6 +154,11 @@ impl MemoryPool {
         let current_cursor = current_cursor.min(self.capacity as usize);
 
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), current_cursor) }
+    }
+
+    fn read_shard_count_header(bytes: &[u8]) -> Option<u32> {
+        let header: [u8; 4] = bytes.get(0..4)?.try_into().ok()?;
+        Some(u32::from_ne_bytes(header))
     }
 }
 
@@ -407,7 +409,7 @@ impl SymbolInterner {
 
         Self {
             interner_id,
-            pool: MemoryPool::new(ARENA_CAPACITY),
+            pool: MemoryPool::new(ARENA_CAPACITY, count as u32),
             shards,
             hash_builder: rustc_hash::FxBuildHasher::default(),
             shard_mask: (count - 1) as u64,
@@ -454,8 +456,11 @@ impl SymbolInterner {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Self {
+        let shard_count =
+            MemoryPool::read_shard_count_header(bytes).unwrap_or(DEFAULT_SHARD_COUNT as u32);
+
         let estimated_symbols = bytes.len() / 16;
-        let interner = Self::with_capacity(estimated_symbols);
+        let interner = Self::with_capacity_and_shards(estimated_symbols, shard_count as usize);
 
         if bytes.len() <= 4 {
             return interner;
