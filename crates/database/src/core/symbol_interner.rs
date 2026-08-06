@@ -129,20 +129,30 @@ impl MemoryPool {
         let len = value.len() as u32;
         let size = len + 4;
 
-        let offset = self.cursor.fetch_add(size, Ordering::Relaxed);
+        let offset_result =
+            self.cursor
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    if size > self.capacity - current {
+                        None
+                    } else {
+                        Some(current + size)
+                    }
+                });
 
-        if offset > self.capacity || size > self.capacity - offset {
-            self.poisoned.store(true, Ordering::Release);
-            panic!("Pool out of memory");
+        match offset_result {
+            Ok(offset) => {
+                unsafe {
+                    let start = self.ptr.as_ptr().add(offset as usize);
+                    std::ptr::write_unaligned(start as *mut u32, len);
+                    std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
+                }
+                offset
+            }
+            Err(_) => {
+                self.poisoned.store(true, Ordering::Release);
+                panic!("Pool out of memory");
+            }
         }
-
-        unsafe {
-            let start = self.ptr.as_ptr().add(offset as usize);
-            std::ptr::write_unaligned(start as *mut u32, len);
-            std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
-        }
-
-        offset
     }
 
     #[inline]
