@@ -126,16 +126,24 @@ impl MemoryPool {
             panic!("Pool out of memory");
         }
 
-        let len = value.len() as u32;
-        let size = len + 4;
+        // Reject strings whose length can't be represented in the u32 header,
+        // or whose encoded size (len + 4-byte header) would overflow u32.
+        let len: u32 = value
+            .len()
+            .try_into()
+            .unwrap_or_else(|_| panic!("string too large to intern: {} bytes", value.len()));
+        let size = len
+            .checked_add(4)
+            .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len()));
 
         let offset_result =
             self.cursor
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    if size > self.capacity - current {
+                    let remaining = self.capacity.checked_sub(current)?;
+                    if size > remaining {
                         None
                     } else {
-                        Some(current + size)
+                        current.checked_add(size)
                     }
                 });
 
