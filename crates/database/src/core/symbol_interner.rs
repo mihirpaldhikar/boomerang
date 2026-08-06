@@ -30,7 +30,7 @@ use std::cell::{Cell, RefCell};
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 const DEFAULT_SHARD_COUNT: usize = 16;
 const CACHE_CAPACITY: usize = 1024; // MUST be a power of 2
@@ -59,7 +59,7 @@ impl Symbol {
     const INDEX_MASK: u32 = 0x00FF_FFFF; // Bottom 24 bits.
 
     fn new(shard_id: u8, index: usize) -> Self {
-        assert!(index < Self::INDEX_MASK as usize, "Shard index overflow");
+        assert!(index < Self::INDEX_MASK as usize, "Symbol index overflow");
 
         let raw = ((shard_id as u32) << 24) | ((index as u32) + 1);
         Symbol(unsafe { NonZeroU32::new_unchecked(raw) })
@@ -91,6 +91,7 @@ struct MemoryPool {
     cursor: AtomicU32,
     capacity: u32,
     layout: Layout,
+    poisoned: AtomicBool,
 }
 
 unsafe impl Send for MemoryPool {}
@@ -103,11 +104,17 @@ impl MemoryPool {
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
 
+        // Bytes [0, 4) are reserved (offset 0 doubles as the "empty" sentinel
+        // in StringChunk::offsets) but are otherwise never written. Zero them
+        // explicitly so `committed_bytes()` never exposes uninitialized memory.
+        unsafe { std::ptr::write_bytes(ptr.as_ptr(), 0, 4) };
+
         Self {
             ptr,
             cursor: AtomicU32::new(4),
             capacity,
             layout,
+            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -118,13 +125,18 @@ impl MemoryPool {
 
     #[inline]
     fn alloc(&self, value: &str) -> u32 {
+        if self.poisoned.load(Ordering::Acquire) {
+            panic!("Pool out of memory");
+        }
+
         let len = value.len() as u32;
         let size = len + 4;
 
         let offset = self.cursor.fetch_add(size, Ordering::Relaxed);
 
-        if offset + size > self.capacity {
-            panic!("Arena out of memory");
+        if offset > self.capacity || size > self.capacity - offset {
+            self.poisoned.store(true, Ordering::Release);
+            panic!("Pool out of memory");
         }
 
         unsafe {
@@ -139,6 +151,11 @@ impl MemoryPool {
     #[inline]
     pub fn committed_bytes(&self) -> &[u8] {
         let current_cursor = self.cursor.load(Ordering::Acquire) as usize;
+
+        // The cursor may have overshot `capacity` right before poisoning; clamp
+        // so we never build a slice that runs past the allocation.
+        let current_cursor = current_cursor.min(self.capacity as usize);
+
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), current_cursor) }
     }
 }
@@ -230,7 +247,11 @@ impl LockFreeStringArray {
             }
 
             let ptr = self.chunks[chunk_idx].load(Ordering::Acquire) as *const StringChunk;
-            cell.set(Some((self.interner_id, self_addr, chunk_idx, ptr)));
+
+            if !ptr.is_null() {
+                cell.set(Some((self.interner_id, self_addr, chunk_idx, ptr)));
+            }
+
             ptr
         })
     }
@@ -245,11 +266,7 @@ impl LockFreeStringArray {
 
         let chunk_ptr = self.load_chunk(chunk_idx);
         if chunk_ptr.is_null() {
-            let fresh = self.chunks[chunk_idx].load(Ordering::Acquire);
-            if fresh.is_null() {
-                return None;
-            }
-            return self.get_from_chunk(fresh as *const StringChunk, slot_idx, base_ptr);
+            return None;
         }
 
         self.get_from_chunk(chunk_ptr, slot_idx, base_ptr)
@@ -624,9 +641,11 @@ impl SymbolInterner {
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
         let shard_id = symbol.shard_id();
+
         if shard_id >= self.shards.len() {
-            unsafe { std::hint::unreachable_unchecked() }
+            return None;
         }
+
         self.shards[shard_id]
             .strings
             .get(symbol.index(), self.pool.base_ptr())
