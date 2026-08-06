@@ -33,6 +33,49 @@ pub enum Action {
     Restrict = 4,
 }
 
+impl From<u8> for Action {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::NoAction,
+            1 => Self::Cascade,
+            2 => Self::SetNull,
+            3 => Self::SetDefault,
+            4 => Self::Restrict,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<Action> for u8 {
+    fn from(value: Action) -> Self {
+        match value {
+            Action::NoAction => 0,
+            Action::Cascade => 1,
+            Action::SetNull => 2,
+            Action::SetDefault => 3,
+            Action::Restrict => 4,
+        }
+    }
+}
+
+impl From<u16> for Action {
+    fn from(value: u16) -> Self {
+        Self::from(value as u8)
+    }
+}
+
+impl From<Action> for u16 {
+    fn from(value: Action) -> Self {
+        match value {
+            Action::NoAction => 0,
+            Action::Cascade => 1,
+            Action::SetNull => 2,
+            Action::SetDefault => 3,
+            Action::Restrict => 4,
+        }
+    }
+}
+
 pub struct ForeignKey {
     pub(crate) constraint_name: Symbol,
     pub(crate) namespace: Symbol,
