@@ -49,7 +49,7 @@ const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
 // Default Arena Capacity: 256 MB.
 const ARENA_CAPACITY: u32 = 256 * 1024 * 1024;
 
-static NEXT_INTERNER_ID: AtomicUsize = AtomicUsize::new(1);
+static NEXT_INTERNER_ID: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -179,8 +179,9 @@ impl Drop for MemoryPool {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct CacheEntry {
-    interner_id: usize,
+    interner_id: u32,
     offset: u32,
     hash: u32,
     symbol: Symbol,
@@ -200,7 +201,7 @@ impl ThreadLocalCache {
 
 thread_local! {
     static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
-    static LAST_CHUNK: Cell<Option<(usize, usize, usize, *const StringChunk)>> = Cell::new(None);
+    static LAST_CHUNK: Cell<Option<(u32, usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
 struct StringChunk {
@@ -222,7 +223,7 @@ impl StringChunk {
 }
 
 struct LockFreeStringArray {
-    interner_id: usize,
+    interner_id: u32,
     chunks: Box<[AtomicPtr<StringChunk>]>,
     len: AtomicUsize,
 }
@@ -231,7 +232,7 @@ unsafe impl Send for LockFreeStringArray {}
 unsafe impl Sync for LockFreeStringArray {}
 
 impl LockFreeStringArray {
-    fn new(interner_id: usize) -> Self {
+    fn new(interner_id: u32) -> Self {
         let chunks = (0..NUM_CHUNKS)
             .map(|_| AtomicPtr::new(std::ptr::null_mut()))
             .collect::<Vec<_>>()
@@ -379,7 +380,7 @@ struct Shard {
 }
 
 pub struct SymbolInterner {
-    interner_id: usize,
+    interner_id: u32,
     pool: MemoryPool,
     shards: Box<[Shard]>,
     hash_builder: rustc_hash::FxBuildHasher,
