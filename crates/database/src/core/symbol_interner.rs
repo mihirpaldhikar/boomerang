@@ -125,7 +125,7 @@ impl MemoryPool {
         let ptr = unsafe { alloc(layout) };
         let ptr = NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(layout));
 
-        unsafe { std::ptr::write_unaligned(ptr.as_ptr() as *mut u32, shard_count) };
+        unsafe { std::ptr::write_unaligned(ptr.as_ptr() as *mut u32, shard_count.to_le()) };
 
         Self {
             ptr,
@@ -178,7 +178,7 @@ impl MemoryPool {
             Ok(offset) => {
                 unsafe {
                     let start = self.ptr.as_ptr().add(offset as usize);
-                    std::ptr::write_unaligned(start as *mut u32, len);
+                    std::ptr::write_unaligned(start as *mut u32, len.to_le());
                     std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
                 }
                 offset
@@ -203,7 +203,7 @@ impl MemoryPool {
 
     fn read_shard_count_header(bytes: &[u8]) -> Option<u32> {
         let header: [u8; 4] = bytes.get(0..4)?.try_into().ok()?;
-        Some(u32::from_ne_bytes(header))
+        Some(u32::from_le_bytes(header))
     }
 }
 
@@ -348,7 +348,7 @@ impl LockFreeStringArray {
         prefetch_read(ptr);
 
         unsafe {
-            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+            let len = u32::from_le(std::ptr::read_unaligned(ptr as *const u32)) as usize;
             let slice = std::slice::from_raw_parts(ptr.add(4), len);
             Some(std::str::from_utf8_unchecked(slice))
         }
@@ -368,7 +368,7 @@ impl LockFreeStringArray {
         prefetch_read(ptr);
 
         unsafe {
-            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+            let len = u32::from_le(std::ptr::read_unaligned(ptr as *const u32)) as usize;
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
         }
     }
@@ -516,7 +516,7 @@ impl SymbolInterner {
         }
 
         let len_bytes: [u8; 4] = bytes[offset..offset + 4].try_into().ok()?;
-        let len = u32::from_ne_bytes(len_bytes) as usize;
+        let len = u32::from_le_bytes(len_bytes) as usize;
 
         if offset + 4 + len > bytes.len() {
             return None;
@@ -540,7 +540,7 @@ impl SymbolInterner {
 
         while cursor + 4 <= bytes.len() {
             let len_bytes: [u8; 4] = bytes[cursor..cursor + 4].try_into().unwrap();
-            let len = u32::from_ne_bytes(len_bytes) as usize;
+            let len = u32::from_le_bytes(len_bytes) as usize;
 
             if cursor + 4 + len > bytes.len() {
                 break;
