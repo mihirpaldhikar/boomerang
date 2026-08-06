@@ -149,7 +149,7 @@ impl MemoryPool {
 
     #[inline]
     fn alloc(&self, value: &str) -> u32 {
-        if self.poisoned.load(Ordering::Acquire) {
+        if self.poisoned.load(Ordering::Relaxed) {
             Self::pool_exhausted()
         }
 
@@ -462,7 +462,10 @@ impl SymbolInterner {
         let interner_id = NEXT_INTERNER_ID.fetch_add(1, Ordering::Relaxed);
 
         let count = count.clamp(1, 256).next_power_of_two();
-        let per_shard = symbols.div_ceil(count);
+
+        // hashbrown resizes around ~87.5% load factor; leave headroom so a
+        // caller's exact-count hint doesn't immediately trigger a rehash.
+        let per_shard = (symbols.div_ceil(count) * 4) / 3;
 
         let shards = (0..count)
             .map(|_| Shard {
@@ -605,7 +608,7 @@ impl SymbolInterner {
 
                         if let Some(text) = shard.strings.get(symbol.index(), self.pool.base_ptr())
                         {
-                            if text.as_bytes() == value.as_bytes() {
+                            if text.len() == value.len() && text.as_bytes() == value.as_bytes() {
                                 found_text = Some(text);
                                 return true;
                             }
