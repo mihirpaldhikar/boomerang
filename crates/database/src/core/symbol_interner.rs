@@ -26,7 +26,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
@@ -65,12 +65,12 @@ impl Symbol {
         Symbol(unsafe { NonZeroU32::new_unchecked(raw) })
     }
 
-    #[inline]
+    #[inline(always)]
     fn shard_id(&self) -> usize {
         (self.0.get() >> 24) as usize
     }
 
-    #[inline]
+    #[inline(always)]
     fn index(&self) -> usize {
         (self.0.get() & Self::INDEX_MASK) as usize - 1
     }
@@ -97,6 +97,27 @@ struct MemoryPool {
 unsafe impl Send for MemoryPool {}
 unsafe impl Sync for MemoryPool {}
 
+/// Hint that the CPU should start pulling `ptr` into L1 cache now, even
+/// though we don't dereference it until later. No-op on architectures
+/// without an explicit prefetch instruction — always safe to call on any
+/// pointer, valid or not, since it never actually reads memory.
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch(ptr as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+        "prfm pldl1keep, [{0}]",
+        in(reg) ptr,
+        options(nostack, preserves_flags)
+        );
+    }
+}
+
 impl MemoryPool {
     fn new(capacity: u32, shard_count: u32) -> Self {
         let layout = Layout::array::<u8>(capacity as usize).expect("valid layout");
@@ -115,15 +136,21 @@ impl MemoryPool {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn base_ptr(&self) -> *const u8 {
         self.ptr.as_ptr() as *const u8
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pool_exhausted() -> ! {
+        panic!("Pool out of memory");
     }
 
     #[inline]
     fn alloc(&self, value: &str) -> u32 {
         if self.poisoned.load(Ordering::Acquire) {
-            panic!("Pool out of memory");
+            Self::pool_exhausted()
         }
 
         // Reject strings whose length can't be represented in the u32 header,
@@ -158,7 +185,7 @@ impl MemoryPool {
             }
             Err(_) => {
                 self.poisoned.store(true, Ordering::Release);
-                panic!("Pool out of memory");
+                Self::pool_exhausted();
             }
         }
     }
@@ -196,19 +223,19 @@ struct CacheEntry {
 }
 
 struct ThreadLocalCache {
-    entries: [Option<CacheEntry>; CACHE_CAPACITY],
+    entries: [Cell<Option<CacheEntry>>; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
     fn new() -> Self {
         Self {
-            entries: [None; CACHE_CAPACITY],
+            entries: std::array::from_fn(|_| Cell::new(None)),
         }
     }
 }
 
 thread_local! {
-    static LOCAL_CACHE: RefCell<ThreadLocalCache> = RefCell::new(ThreadLocalCache::new());
+    static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
     static LAST_CHUNK: Cell<Option<(u32, usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
@@ -227,6 +254,11 @@ impl StringChunk {
 
             Box::from_raw(raw.as_ptr() as *mut StringChunk)
         }
+    }
+
+    #[cold]
+    fn alloc_new_chunk() -> *mut StringChunk {
+        Box::into_raw(StringChunk::new_boxed())
     }
 }
 
@@ -307,8 +339,15 @@ impl LockFreeStringArray {
             return None;
         }
 
+        let ptr = unsafe { base_ptr.add(offset as usize) };
+
+        // Kick off the fetch for the length header + first ~64 bytes of the
+        // string as early as possible, before the caller does anything else
+        // with `ptr`. Hides some of the DRAM round-trip behind whatever
+        // instructions the compiler schedules between here and the actual read.
+        prefetch_read(ptr);
+
         unsafe {
-            let ptr = base_ptr.add(offset as usize);
             let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
             let slice = std::slice::from_raw_parts(ptr.add(4), len);
             Some(std::str::from_utf8_unchecked(slice))
@@ -324,22 +363,24 @@ impl LockFreeStringArray {
         let chunk = unsafe { &*chunk_ptr };
 
         let offset = chunk.offsets[slot_idx].load(Ordering::Acquire);
-        unsafe {
-            let ptr = base_ptr.add(offset as usize);
-            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+        let ptr = unsafe { base_ptr.add(offset as usize) };
 
+        prefetch_read(ptr);
+
+        unsafe {
+            let len = std::ptr::read_unaligned(ptr as *const u32) as usize;
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
         }
     }
 
     fn push(&self, offset: u32) -> usize {
-        let index = self.len.load(Ordering::Relaxed);
+        let index = self.len.fetch_add(1, Ordering::AcqRel);
         let chunk_idx = index >> CHUNK_SHIFT;
         let slot_idx = index & CHUNK_MASK;
 
         let mut chunk_ptr = self.chunks[chunk_idx].load(Ordering::Acquire);
         if chunk_ptr.is_null() {
-            let new_chunk = Box::into_raw(StringChunk::new_boxed());
+            let new_chunk = StringChunk::alloc_new_chunk();
             match self.chunks[chunk_idx].compare_exchange(
                 std::ptr::null_mut(),
                 new_chunk,
@@ -357,10 +398,7 @@ impl LockFreeStringArray {
         }
 
         let chunk = unsafe { &*chunk_ptr };
-
         chunk.offsets[slot_idx].store(offset, Ordering::Release);
-        self.len.store(index + 1, Ordering::Release);
-
         index
     }
 }
@@ -379,7 +417,17 @@ impl Drop for LockFreeStringArray {
 }
 
 struct ShardInner {
-    entries: HashTable<(u64, Symbol)>,
+    entries: HashTable<(u64, u32, Symbol)>,
+}
+
+impl ShardInner {
+    #[inline(always)]
+    fn prefix4(bytes: &[u8]) -> u32 {
+        let mut buf = [0u8; 4];
+        let n = bytes.len().min(4);
+        buf[..n].copy_from_slice(&bytes[..n]);
+        u32::from_ne_bytes(buf) // native-endian: only ever compared, never serialized
+    }
 }
 
 struct Shard {
@@ -508,15 +556,15 @@ impl SymbolInterner {
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
         let hash = self.hash_builder.hash_one(value);
+        let prefix = ShardInner::prefix4(value.as_bytes());
 
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
         let cache_line_base = ((hash & CACHE_MASK) & !3) as usize;
 
         let cached = LOCAL_CACHE.with(|cache| {
-            let cache = cache.borrow();
             for i in 0..4 {
-                if let Some(entry) = cache.entries[cache_line_base + i] {
+                if let Some(entry) = cache.entries[cache_line_base + i].get() {
                     if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
                         let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
                         let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
@@ -547,15 +595,24 @@ impl SymbolInterner {
             let inner = shard.inner.read();
             let mut found_text = None;
 
-            if let Some(&(_, symbol)) = inner.entries.find(hash, |&(_, symbol)| {
-                if let Some(text) = shard.strings.get(symbol.index(), self.pool.base_ptr()) {
-                    if text == value {
-                        found_text = Some(text);
-                        return true;
-                    }
-                }
-                false
-            }) {
+            if let Some(&(_, _, symbol)) =
+                inner
+                    .entries
+                    .find(hash, |&(cand_hash, cand_prefix, symbol)| {
+                        if cand_hash != hash || cand_prefix != prefix {
+                            return false;
+                        }
+
+                        if let Some(text) = shard.strings.get(symbol.index(), self.pool.base_ptr())
+                        {
+                            if text.as_bytes() == value.as_bytes() {
+                                found_text = Some(text);
+                                return true;
+                            }
+                        }
+                        false
+                    })
+            {
                 resolved = Some((found_text.unwrap(), symbol));
             }
         }
@@ -567,32 +624,34 @@ impl SymbolInterner {
 
             match inner.entries.entry(
                 hash,
-                |&(_, symbol)| {
-                    shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
+                |&(cand_hash, cand_prefix, symbol)| {
+                    cand_hash == hash
+                        && cand_prefix == prefix
+                        && shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
                 },
-                |&(cached_hash, _)| cached_hash,
+                |&(cached_hash, _, _)| cached_hash,
             ) {
                 Entry::Occupied(entry) => {
-                    let symbol = entry.get().1;
-                    (
+                    let symbol = entry.get().2;
+
+                    // SAFETY: symbol came from a live hashtable entry, so its index was
+                    // successfully pushed to shard.strings and is < len. No need to
+                    // re-pay the len.load(Acquire) + branch that `get()` does.
+                    let text = unsafe {
                         shard
                             .strings
-                            .get(symbol.index(), self.pool.base_ptr())
-                            .unwrap(),
-                        symbol,
-                    )
+                            .get_unchecked(symbol.index(), self.pool.base_ptr())
+                    };
+
+                    (text, symbol)
                 }
                 Entry::Vacant(entry) => {
                     let offset = self.pool.alloc(value);
-
                     let index = shard.strings.push(offset);
-
                     let symbol = Symbol::new(shard_id as u8, index);
-                    entry.insert((hash, symbol));
-
+                    entry.insert((hash, prefix, symbol));
                     let ptr = unsafe { self.pool.base_ptr().add(offset as usize) };
-                    let len = value.len();
-                    let slice = unsafe { std::slice::from_raw_parts(ptr.add(4), len) };
+                    let slice = unsafe { std::slice::from_raw_parts(ptr.add(4), value.len()) };
                     (unsafe { std::str::from_utf8_unchecked(slice) }, symbol)
                 }
             }
@@ -601,13 +660,12 @@ impl SymbolInterner {
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
         LOCAL_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some(CacheEntry {
+            cache.entries[cache_index].set(Some(CacheEntry {
                 interner_id: self.interner_id,
                 offset,
                 hash: hash_trunc,
                 symbol,
-            });
+            }));
         });
 
         symbol
@@ -615,28 +673,34 @@ impl SymbolInterner {
 
     pub fn get(&self, value: &str) -> Option<Symbol> {
         let hash = self.hash_builder.hash_one(value);
+        let prefix = ShardInner::prefix4(value.as_bytes());
+
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
+        let cache_line_base = ((hash & CACHE_MASK) & !3) as usize;
 
-        let mut hit = None;
-        LOCAL_CACHE.with(|cache| {
-            let cache = cache.borrow();
-            if let Some(entry) = cache.entries[cache_index] {
-                if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                    let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
-                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
-                    let cached_value = unsafe {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
-                    };
-
-                    if cached_value == value {
-                        hit = Some(entry.symbol);
+        let cached = LOCAL_CACHE.with(|cache| {
+            for i in 0..4 {
+                if let Some(entry) = cache.entries[cache_line_base + i].get() {
+                    if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
+                        let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
+                        let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
+                        let cached_value = unsafe {
+                            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                                ptr.add(4),
+                                len,
+                            ))
+                        };
+                        if cached_value == value {
+                            return Some(entry.symbol);
+                        }
                     }
                 }
             }
+            None
         });
 
-        if let Some(symbol) = hit {
+        if let Some(symbol) = cached {
             return Some(symbol);
         }
 
@@ -647,23 +711,24 @@ impl SymbolInterner {
 
         let symbol = inner
             .entries
-            .find(hash, |&(_, symbol)| {
-                shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
+            .find(hash, |&(cand_hash, cand_prefix, symbol)| {
+                cand_hash == hash
+                    && cand_prefix == prefix
+                    && shard.strings.get(symbol.index(), self.pool.base_ptr()) == Some(value)
             })
-            .map(|&(_, symbol)| symbol)?;
+            .map(|&(_, _, symbol)| symbol)?;
 
         let text = shard.strings.get(symbol.index(), self.pool.base_ptr())?;
 
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
         LOCAL_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            cache.entries[cache_index] = Some(CacheEntry {
+            cache.entries[cache_index].set(Some(CacheEntry {
                 interner_id: self.interner_id,
                 offset,
                 hash: hash_trunc,
                 symbol,
-            });
+            }));
         });
 
         Some(symbol)
