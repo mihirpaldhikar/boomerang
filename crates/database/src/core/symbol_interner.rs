@@ -500,28 +500,34 @@ impl SymbolInterner {
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
         let hash = self.hash_builder.hash_one(value);
+
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
+        let cache_line_base = ((hash & CACHE_MASK) & !3) as usize;
 
-        let mut hit = None;
-        LOCAL_CACHE.with(|cache| {
+        let cached = LOCAL_CACHE.with(|cache| {
             let cache = cache.borrow();
-            if let Some(entry) = cache.entries[cache_index] {
-                if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                    let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
-                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
-                    let cached_value = unsafe {
-                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr.add(4), len))
-                    };
-
-                    if cached_value == value {
-                        hit = Some(entry.symbol);
+            for i in 0..4 {
+                if let Some(entry) = cache.entries[cache_line_base + i] {
+                    if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
+                        let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
+                        let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
+                        let cached_value = unsafe {
+                            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                                ptr.add(4),
+                                len,
+                            ))
+                        };
+                        if cached_value == value {
+                            return Some(entry.symbol);
+                        }
                     }
                 }
             }
+            None
         });
 
-        if let Some(symbol) = hit {
+        if let Some(symbol) = cached {
             return symbol;
         }
 
