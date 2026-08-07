@@ -205,15 +205,13 @@ impl MemoryPool {
             Self::pool_exhausted(shard_id);
         }
 
-        let len: u32 = value
-            .len()
-            .try_into()
-            .unwrap_or_else(|_| panic!("string too large to intern: {} bytes", value.len()));
-
-        let size = padded_record_size(
-            len.checked_add(0)
-                .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len())),
+        debug_assert!(
+            value.len() < (u32::MAX - 7) as usize,
+            "string too large to intern"
         );
+
+        let len = value.len() as u32;
+        let size = padded_record_size(len);
 
         let current = shard.value.load(Ordering::Relaxed);
         let remaining = match self.region_size.checked_sub(current) {
@@ -243,23 +241,26 @@ impl MemoryPool {
     }
 
     pub fn committed_bytes(&self) -> Vec<u8> {
-        let shard_count = self.cursors.len();
-        let mut out = Vec::new();
+        let used: Vec<u32> = self
+            .cursors
+            .iter()
+            .map(|c| c.value.load(Ordering::Acquire).min(self.region_size))
+            .collect();
+
+        let total_size =
+            self.header_size as usize + used.iter().map(|&u| u as usize).sum::<usize>();
+        let mut out = Vec::with_capacity(total_size);
 
         let header =
             unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.header_size as usize) };
         out.extend_from_slice(header);
 
-        for shard_id in 0..shard_count {
+        for (shard_id, &shard_used) in used.iter().enumerate() {
             let region_start = self.header_size + shard_id as u32 * self.region_size;
-            let used = self.cursors[shard_id]
-                .value
-                .load(Ordering::Acquire)
-                .min(self.region_size);
             let region_bytes = unsafe {
                 std::slice::from_raw_parts(
                     self.ptr.as_ptr().add(region_start as usize),
-                    used as usize,
+                    shard_used as usize,
                 )
             };
             out.extend_from_slice(region_bytes);
@@ -639,13 +640,46 @@ impl SymbolInterner {
 
             let str_slice = &bytes[cursor + 4..cursor + 4 + len];
             if let Ok(text) = std::str::from_utf8(str_slice) {
-                interner.get_or_intern(text);
+                interner.insert_unique(text);
             }
 
             cursor += padded_record_size(len as u32) as usize;
         }
 
         interner
+    }
+
+    fn insert_unique(&self, value: &str) -> Symbol {
+        let len = value.len();
+        if len == 0 {
+            return Symbol::new(STATIC_SHARD_ID, 0);
+        }
+        if len == 1 {
+            let b = value.as_bytes()[0];
+            if b < 128 {
+                return Symbol::new(STATIC_SHARD_ID, (b as usize) + 1);
+            }
+        }
+
+        let prefix = ShardInner::prefix8(value.as_bytes());
+        let hash = if len <= 8 {
+            let h = prefix.wrapping_mul(0x517cc1b727220a95);
+            h ^ (h >> 32)
+        } else {
+            self.hash_builder.hash_one(value)
+        };
+
+        let shard_id = (hash & self.shard_mask) as usize;
+        let shard = &self.shards[shard_id];
+
+        let mut inner = shard.inner.write();
+        let offset = self.pool.alloc(shard_id, value);
+        let index = shard.strings.push(offset);
+        let symbol = Symbol::new(shard_id as u8, index);
+        inner
+            .entries
+            .insert_unique(hash, (hash, prefix, symbol), |&(h, _, _)| h);
+        symbol
     }
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
@@ -721,12 +755,12 @@ impl SymbolInterner {
             if let Some(&(_, _, symbol)) =
                 inner.entries.find(hash, |&(cand_hash, cand_prefix, sym)| {
                     cand_hash == hash
-                        && cand_prefix == prefix
-                        && shard
-                            .strings
-                            .get(sym.index(), self.pool.base_ptr())
-                            .map(|s| s.as_bytes())
-                            == Some(value.as_bytes())
+                    && cand_prefix == prefix
+                    // SAFETY: symbol came from a hashtable entry currently live under
+                    // this shard's read lock — its index is guaranteed < len, no
+                    // need for the bounds-checked len.load() inside `get`.
+                    && unsafe { shard.strings.get_unchecked(sym.index(), self.pool.base_ptr()) }
+                    .as_bytes() == value.as_bytes()
                 })
             {
                 let text = shard
