@@ -374,17 +374,11 @@ fn bench_serialization(c: &mut Criterion) {
             interner.get_or_intern(&s);
         }
         let serialized: Vec<u8> = interner.bytes().to_vec();
-
-        group.bench_with_input(BenchmarkId::new("bytes_encode_view", n), &n, |b, _| {
-            b.iter(|| {
-                black_box(interner.bytes());
-            })
-        });
-
+        
         group.throughput(Throughput::Bytes(serialized.len() as u64));
         group.bench_with_input(BenchmarkId::new("bytes_encode_copy", n), &n, |b, _| {
             b.iter(|| {
-                black_box(interner.bytes().to_vec());
+                black_box(interner.bytes());
             })
         });
 

@@ -26,7 +26,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::{Cell, UnsafeCell};
+use std::cell::Cell;
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
@@ -98,12 +98,28 @@ impl Symbol {
     }
 }
 
+#[repr(align(64))]
+struct ShardCursor {
+    value: AtomicU32,
+    poisoned: AtomicBool,
+}
+
+impl ShardCursor {
+    fn new() -> Self {
+        Self {
+            value: AtomicU32::new(0),
+            poisoned: AtomicBool::new(false),
+        }
+    }
+}
+
 struct MemoryPool {
     ptr: NonNull<u8>,
-    cursor: AtomicU32,
+    cursors: Box<[ShardCursor]>,
+    region_size: u32,
+    header_size: u32,
     capacity: u32,
     layout: Layout,
-    poisoned: AtomicBool,
 }
 
 unsafe impl Send for MemoryPool {}
@@ -130,8 +146,21 @@ fn prefetch_read(ptr: *const u8) {
     }
 }
 
+#[inline(always)]
+fn padded_record_size(len: u32) -> u32 {
+    (len + 4 + 3) & !3
+}
+
 impl MemoryPool {
+    const HEADER_SIZE: u32 = 4;
+
     fn new(capacity: u32, shard_count: u32) -> Self {
+        assert!(shard_count > 0, "shard_count must be nonzero");
+        assert!(
+            capacity > Self::HEADER_SIZE,
+            "capacity must be larger than the header"
+        );
+
         let layout = Layout::array::<u8>(capacity as usize).expect("valid layout");
 
         let ptr = unsafe { alloc(layout) };
@@ -139,12 +168,21 @@ impl MemoryPool {
 
         unsafe { std::ptr::write_unaligned(ptr.as_ptr() as *mut u32, shard_count.to_le()) };
 
+        let region_size = ((capacity - Self::HEADER_SIZE) / shard_count) & !3;
+        assert!(region_size > 0, "capacity too small for shard_count");
+
+        let cursors = (0..shard_count)
+            .map(|_| ShardCursor::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Self {
             ptr,
-            cursor: AtomicU32::new(4),
+            cursors,
+            region_size,
+            header_size: Self::HEADER_SIZE,
             capacity,
             layout,
-            poisoned: AtomicBool::new(false),
         }
     }
 
@@ -155,65 +193,79 @@ impl MemoryPool {
 
     #[cold]
     #[inline(never)]
-    fn pool_exhausted() -> ! {
-        panic!("Pool out of memory");
+    fn pool_exhausted(shard_id: usize) -> ! {
+        panic!("Pool out of memory: shard {shard_id} exhausted its region");
     }
 
     #[inline]
-    fn alloc(&self, value: &str) -> u32 {
-        if self.poisoned.load(Ordering::Relaxed) {
-            Self::pool_exhausted()
+    fn alloc(&self, shard_id: usize, value: &str) -> u32 {
+        let shard = &self.cursors[shard_id];
+
+        if shard.poisoned.load(Ordering::Relaxed) {
+            Self::pool_exhausted(shard_id);
         }
 
-        // Reject strings whose length can't be represented in the u32 header,
-        // or whose encoded size (len + 4-byte header) would overflow u32.
         let len: u32 = value
             .len()
             .try_into()
             .unwrap_or_else(|_| panic!("string too large to intern: {} bytes", value.len()));
 
-        let size = (len
-            .checked_add(4)
-            .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len()))
-            + 3)
-            & !3;
+        let size = padded_record_size(
+            len.checked_add(0)
+                .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len())),
+        );
 
-        let offset_result =
-            self.cursor
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    let remaining = self.capacity.checked_sub(current)?;
-                    if size > remaining {
-                        None
-                    } else {
-                        current.checked_add(size)
-                    }
-                });
-
-        match offset_result {
-            Ok(offset) => {
-                unsafe {
-                    let start = self.ptr.as_ptr().add(offset as usize);
-                    std::ptr::write_unaligned(start as *mut u32, len.to_le());
-                    std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
-                }
-                offset
+        let current = shard.value.load(Ordering::Relaxed);
+        let remaining = match self.region_size.checked_sub(current) {
+            Some(r) => r,
+            None => {
+                shard.poisoned.store(true, Ordering::Release);
+                Self::pool_exhausted(shard_id);
             }
-            Err(_) => {
-                self.poisoned.store(true, Ordering::Release);
-                Self::pool_exhausted();
-            }
+        };
+        if size > remaining {
+            shard.poisoned.store(true, Ordering::Release);
+            Self::pool_exhausted(shard_id);
         }
+
+        let global_offset = self.header_size + shard_id as u32 * self.region_size + current;
+        debug_assert!(global_offset + size <= self.capacity);
+
+        unsafe {
+            let start = self.ptr.as_ptr().add(global_offset as usize);
+            std::ptr::write_unaligned(start as *mut u32, len.to_le());
+            std::ptr::copy_nonoverlapping(value.as_ptr(), start.add(4), len as usize);
+        }
+
+        shard.value.store(current + size, Ordering::Release);
+
+        global_offset
     }
 
-    #[inline]
-    pub fn committed_bytes(&self) -> &[u8] {
-        let current_cursor = self.cursor.load(Ordering::Acquire) as usize;
+    pub fn committed_bytes(&self) -> Vec<u8> {
+        let shard_count = self.cursors.len();
+        let mut out = Vec::new();
 
-        // The cursor may have overshot `capacity` right before poisoning; clamp
-        // so we never build a slice that runs past the allocation.
-        let current_cursor = current_cursor.min(self.capacity as usize);
+        let header =
+            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.header_size as usize) };
+        out.extend_from_slice(header);
 
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), current_cursor) }
+        for shard_id in 0..shard_count {
+            let region_start = self.header_size + shard_id as u32 * self.region_size;
+            let used = self.cursors[shard_id]
+                .value
+                .load(Ordering::Acquire)
+                .min(self.region_size);
+            let region_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.ptr.as_ptr().add(region_start as usize),
+                    used as usize,
+                )
+            };
+            out.extend_from_slice(region_bytes);
+        }
+
+        out
     }
 
     fn read_shard_count_header(bytes: &[u8]) -> Option<u32> {
@@ -238,29 +290,29 @@ struct CacheEntry {
 }
 
 struct ThreadLocalCache {
-    interner_ids: [u32; CACHE_CAPACITY],
-    hashes: [u32; CACHE_CAPACITY],
-    lens: [u32; CACHE_CAPACITY],
-    offsets: [u32; CACHE_CAPACITY],
-    symbols: [u32; CACHE_CAPACITY],
-    prefixes: [u64; CACHE_CAPACITY],
+    interner_ids: [Cell<u32>; CACHE_CAPACITY],
+    hashes: [Cell<u32>; CACHE_CAPACITY],
+    lens: [Cell<u32>; CACHE_CAPACITY],
+    offsets: [Cell<u32>; CACHE_CAPACITY],
+    symbols: [Cell<u32>; CACHE_CAPACITY],
+    prefixes: [Cell<u64>; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
     fn new() -> Self {
         Self {
-            interner_ids: [0; CACHE_CAPACITY],
-            hashes: [0; CACHE_CAPACITY],
-            lens: [0; CACHE_CAPACITY],
-            offsets: [0; CACHE_CAPACITY],
-            symbols: [0; CACHE_CAPACITY],
-            prefixes: [0; CACHE_CAPACITY],
+            interner_ids: std::array::from_fn(|_| Cell::new(0)),
+            hashes: std::array::from_fn(|_| Cell::new(0)),
+            lens: std::array::from_fn(|_| Cell::new(0)),
+            offsets: std::array::from_fn(|_| Cell::new(0)),
+            symbols: std::array::from_fn(|_| Cell::new(0)),
+            prefixes: std::array::from_fn(|_| Cell::new(0)),
         }
     }
 }
 
 thread_local! {
-   static LOCAL_CACHE: UnsafeCell<ThreadLocalCache> = UnsafeCell::new(ThreadLocalCache::new());
+    static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
     static LAST_CHUNK: Cell<Option<(u32, usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
@@ -500,7 +552,7 @@ impl SymbolInterner {
     pub fn with_capacity_and_shards(symbols: usize, count: usize) -> Self {
         let interner_id = NEXT_INTERNER_ID.fetch_add(1, Ordering::Relaxed);
 
-        let count = count.clamp(1, 256).next_power_of_two();
+        let count = count.clamp(1, 128).next_power_of_two();
 
         // hashbrown resizes around ~87.5% load factor; leave headroom so a
         // caller's exact-count hint doesn't immediately trigger a rehash.
@@ -525,7 +577,7 @@ impl SymbolInterner {
         }
     }
 
-    pub fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> Vec<u8> {
         self.pool.committed_bytes()
     }
 
@@ -590,7 +642,7 @@ impl SymbolInterner {
                 interner.get_or_intern(text);
             }
 
-            cursor += 4 + len;
+            cursor += padded_record_size(len as u32) as usize;
         }
 
         interner
@@ -611,7 +663,8 @@ impl SymbolInterner {
 
         let prefix = ShardInner::prefix8(value.as_bytes());
         let hash = if len <= 8 {
-            prefix.wrapping_mul(0x517cc1b727220a95)
+            let h = prefix.wrapping_mul(0x517cc1b727220a95);
+            h ^ (h >> 32)
         } else {
             self.hash_builder.hash_one(value)
         };
@@ -620,33 +673,34 @@ impl SymbolInterner {
         let hash_trunc = hash as u32;
         let cache_line_base = cache_index & !3;
 
-        let cached = LOCAL_CACHE.with(|cell| unsafe {
-            let cache = &mut *cell.get();
+        let cached = LOCAL_CACHE.with(|cache| {
             let mut candidate_idx = usize::MAX;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
-                if cache.interner_ids[idx] == self.interner_id
-                    && cache.hashes[idx] == hash_trunc
-                    && cache.lens[idx] == len as u32
-                    && cache.prefixes[idx] == prefix
+                if cache.interner_ids[idx].get() == self.interner_id
+                    && cache.hashes[idx].get() == hash_trunc
+                    && cache.lens[idx].get() == len as u32
+                    && cache.prefixes[idx].get() == prefix
                 {
                     candidate_idx = idx;
+                    break;
                 }
             }
 
             if candidate_idx != usize::MAX {
                 if len <= 8 {
-                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx].get()).unwrap());
                 }
 
-                let ptr = self
-                    .pool
-                    .base_ptr()
-                    .add(cache.offsets[candidate_idx] as usize);
-                let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                let ptr = unsafe {
+                    self.pool
+                        .base_ptr()
+                        .add(cache.offsets[candidate_idx].get() as usize)
+                };
+                let cached_value = unsafe { std::slice::from_raw_parts(ptr.add(4), len) };
                 if cached_value == value.as_bytes() {
-                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx].get()).unwrap());
                 }
             }
 
@@ -712,7 +766,7 @@ impl SymbolInterner {
                     (text, symbol)
                 }
                 Entry::Vacant(entry) => {
-                    let offset = self.pool.alloc(value);
+                    let offset = self.pool.alloc(shard_id, value);
                     let index = shard.strings.push(offset);
                     let symbol = Symbol::new(shard_id as u8, index);
                     entry.insert((hash, prefix, symbol));
@@ -725,32 +779,31 @@ impl SymbolInterner {
 
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
-        LOCAL_CACHE.with(|cell| unsafe {
-            let cache = &mut *cell.get();
-            let mut inserted = false;
+        LOCAL_CACHE.with(|cache| {
             let len_u32 = value.len() as u32;
+            let mut inserted = false;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
-                if cache.interner_ids[idx] == 0 {
-                    cache.interner_ids[idx] = self.interner_id;
-                    cache.hashes[idx] = hash_trunc;
-                    cache.lens[idx] = len_u32;
-                    cache.offsets[idx] = offset;
-                    cache.symbols[idx] = symbol.into_raw();
-                    cache.prefixes[idx] = prefix;
+                if cache.interner_ids[idx].get() == 0 {
+                    cache.interner_ids[idx].set(self.interner_id);
+                    cache.hashes[idx].set(hash_trunc);
+                    cache.lens[idx].set(len_u32);
+                    cache.offsets[idx].set(offset);
+                    cache.symbols[idx].set(symbol.into_raw());
+                    cache.prefixes[idx].set(prefix);
                     inserted = true;
                     break;
                 }
             }
 
             if !inserted {
-                cache.interner_ids[cache_index] = self.interner_id;
-                cache.hashes[cache_index] = hash_trunc;
-                cache.lens[cache_index] = len_u32;
-                cache.offsets[cache_index] = offset;
-                cache.symbols[cache_index] = symbol.into_raw();
-                cache.prefixes[cache_index] = prefix;
+                cache.interner_ids[cache_index].set(self.interner_id);
+                cache.hashes[cache_index].set(hash_trunc);
+                cache.lens[cache_index].set(len_u32);
+                cache.offsets[cache_index].set(offset);
+                cache.symbols[cache_index].set(symbol.into_raw());
+                cache.prefixes[cache_index].set(prefix);
             }
         });
 
@@ -773,7 +826,8 @@ impl SymbolInterner {
 
         let prefix = ShardInner::prefix8(value.as_bytes());
         let hash = if len <= 8 {
-            prefix.wrapping_mul(0x517cc1b727220a95)
+            let h = prefix.wrapping_mul(0x517cc1b727220a95);
+            h ^ (h >> 32)
         } else {
             self.hash_builder.hash_one(value)
         };
@@ -782,33 +836,34 @@ impl SymbolInterner {
         let hash_trunc = hash as u32;
         let cache_line_base = cache_index & !3;
 
-        let cached = LOCAL_CACHE.with(|cell| unsafe {
-            let cache = &mut *cell.get();
+        let cached = LOCAL_CACHE.with(|cache| {
             let mut candidate_idx = usize::MAX;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
-                if cache.interner_ids[idx] == self.interner_id
-                    && cache.hashes[idx] == hash_trunc
-                    && cache.lens[idx] == len as u32
-                    && cache.prefixes[idx] == prefix
+                if cache.interner_ids[idx].get() == self.interner_id
+                    && cache.hashes[idx].get() == hash_trunc
+                    && cache.lens[idx].get() == len as u32
+                    && cache.prefixes[idx].get() == prefix
                 {
                     candidate_idx = idx;
+                    break;
                 }
             }
 
             if candidate_idx != usize::MAX {
                 if len <= 8 {
-                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx].get()).unwrap());
                 }
 
-                let ptr = self
-                    .pool
-                    .base_ptr()
-                    .add(cache.offsets[candidate_idx] as usize);
-                let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                let ptr = unsafe {
+                    self.pool
+                        .base_ptr()
+                        .add(cache.offsets[candidate_idx].get() as usize)
+                };
+                let cached_value = unsafe { std::slice::from_raw_parts(ptr.add(4), len) };
                 if cached_value == value.as_bytes() {
-                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx].get()).unwrap());
                 }
             }
 
@@ -837,30 +892,31 @@ impl SymbolInterner {
 
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
-        LOCAL_CACHE.with(|cell| unsafe {
-            let cache = &mut *cell.get();
-            let mut inserted = false;
+        LOCAL_CACHE.with(|cache| {
             let len_u32 = value.len() as u32;
+            let mut inserted = false;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
-                if cache.interner_ids[idx] == 0 {
-                    cache.interner_ids[idx] = self.interner_id;
-                    cache.hashes[idx] = hash_trunc;
-                    cache.lens[idx] = len_u32;
-                    cache.offsets[idx] = offset;
-                    cache.symbols[idx] = symbol.into_raw();
+                if cache.interner_ids[idx].get() == 0 {
+                    cache.interner_ids[idx].set(self.interner_id);
+                    cache.hashes[idx].set(hash_trunc);
+                    cache.lens[idx].set(len_u32);
+                    cache.offsets[idx].set(offset);
+                    cache.symbols[idx].set(symbol.into_raw());
+                    cache.prefixes[idx].set(prefix);
                     inserted = true;
                     break;
                 }
             }
 
             if !inserted {
-                cache.interner_ids[cache_index] = self.interner_id;
-                cache.hashes[cache_index] = hash_trunc;
-                cache.lens[cache_index] = len_u32;
-                cache.offsets[cache_index] = offset;
-                cache.symbols[cache_index] = symbol.into_raw();
+                cache.interner_ids[cache_index].set(self.interner_id);
+                cache.hashes[cache_index].set(hash_trunc);
+                cache.lens[cache_index].set(len_u32);
+                cache.offsets[cache_index].set(offset);
+                cache.symbols[cache_index].set(symbol.into_raw());
+                cache.prefixes[cache_index].set(prefix);
             }
         });
 
@@ -1181,5 +1237,23 @@ mod tests {
         }
 
         assert_eq!(interner.len(), (num_threads * iterations) + 100);
+    }
+
+    #[test]
+    fn from_bytes_round_trip_preserves_all_entries() {
+        let interner = SymbolInterner::new();
+        let originals: Vec<String> = (0..100_000).map(|i| format!("bench_unique_{i}_")).collect();
+        for s in &originals {
+            interner.get_or_intern(s);
+        }
+        let expected_len = interner.len();
+
+        let bytes = interner.bytes();
+        let decoded = SymbolInterner::from_bytes(&bytes);
+
+        assert_eq!(decoded.len(), expected_len, "from_bytes dropped entries!");
+        for s in &originals {
+            assert!(decoded.contains(s), "missing after round-trip: {s}");
+        }
     }
 }
