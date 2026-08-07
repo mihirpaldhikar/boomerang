@@ -26,7 +26,7 @@ use hashbrown::HashTable;
 use hashbrown::hash_table::Entry;
 use parking_lot::RwLock;
 use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::hash::{BuildHasher, Hash};
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
@@ -50,6 +50,18 @@ const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
 const ARENA_CAPACITY: u32 = 512 * 1024 * 1024;
 
 static NEXT_INTERNER_ID: AtomicU32 = AtomicU32::new(1);
+
+const STATIC_SHARD_ID: u8 = 255;
+const ASCII_STRINGS: [&str; 128] = [
+    "\x00", "\x01", "\x02", "\x03", "\x04", "\x05", "\x06", "\x07", "\x08", "\t", "\n", "\x0B",
+    "\x0C", "\r", "\x0E", "\x0F", "\x10", "\x11", "\x12", "\x13", "\x14", "\x15", "\x16", "\x17",
+    "\x18", "\x19", "\x1A", "\x1B", "\x1C", "\x1D", "\x1E", "\x1F", " ", "!", "\"", "#", "$", "%",
+    "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", "0", "1", "2", "3", "4", "5", "6", "7", "8",
+    "9", ":", ";", "<", "=", ">", "?", "@", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K",
+    "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "[", "\\", "]", "^",
+    "_", "`", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q",
+    "r", "s", "t", "u", "v", "w", "x", "y", "z", "{", "|", "}", "~", "\x7F",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
@@ -159,9 +171,12 @@ impl MemoryPool {
             .len()
             .try_into()
             .unwrap_or_else(|_| panic!("string too large to intern: {} bytes", value.len()));
-        let size = len
+
+        let size = (len
             .checked_add(4)
-            .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len()));
+            .unwrap_or_else(|| panic!("string too large to intern: {} bytes", value.len()))
+            + 3)
+            & !3;
 
         let offset_result =
             self.cursor
@@ -223,19 +238,25 @@ struct CacheEntry {
 }
 
 struct ThreadLocalCache {
-    entries: [Cell<Option<CacheEntry>>; CACHE_CAPACITY],
+    interner_ids: [u32; CACHE_CAPACITY],
+    hashes: [u32; CACHE_CAPACITY],
+    offsets: [u32; CACHE_CAPACITY],
+    symbols: [u32; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
     fn new() -> Self {
         Self {
-            entries: std::array::from_fn(|_| Cell::new(None)),
+            interner_ids: [0; CACHE_CAPACITY],
+            hashes: [0; CACHE_CAPACITY],
+            offsets: [0; CACHE_CAPACITY],
+            symbols: [0; CACHE_CAPACITY],
         }
     }
 }
 
 thread_local! {
-    static LOCAL_CACHE: ThreadLocalCache = ThreadLocalCache::new();
+   static LOCAL_CACHE: UnsafeCell<ThreadLocalCache> = UnsafeCell::new(ThreadLocalCache::new());
     static LAST_CHUNK: Cell<Option<(u32, usize, usize, *const StringChunk)>> = Cell::new(None);
 }
 
@@ -558,31 +579,44 @@ impl SymbolInterner {
     }
 
     pub fn get_or_intern(&self, value: &str) -> Symbol {
+        let len = value.len();
+        if len == 0 {
+            return Symbol::new(STATIC_SHARD_ID, 0);
+        }
+
+        if len == 1 {
+            let b = value.as_bytes()[0];
+            if b < 128 {
+                return Symbol::new(STATIC_SHARD_ID, (b as usize) + 1);
+            }
+        }
+
         let hash = self.hash_builder.hash_one(value);
         let prefix = ShardInner::prefix4(value.as_bytes());
 
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
-        let cache_line_base = ((hash & CACHE_MASK) & !3) as usize;
+        let cache_line_base = cache_index & !3;
 
-        let cached = LOCAL_CACHE.with(|cache| {
+        let cached = LOCAL_CACHE.with(|cell| unsafe {
+            let cache = &mut *cell.get();
+
             for i in 0..4 {
-                if let Some(entry) = cache.entries[cache_line_base + i].get() {
-                    if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                        let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
-                        let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
-                        let cached_value = unsafe {
-                            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                                ptr.add(4),
-                                len,
-                            ))
-                        };
-                        if cached_value == value {
-                            return Some(entry.symbol);
+                let idx = cache_line_base + i;
+
+                if cache.interner_ids[idx] == self.interner_id && cache.hashes[idx] == hash_trunc {
+                    let ptr = self.pool.base_ptr().add(cache.offsets[idx] as usize);
+                    let cached_len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+
+                    if cached_len == len {
+                        let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                        if cached_value == value.as_bytes() {
+                            return Some(Symbol::from_raw(cache.symbols[idx]).unwrap());
                         }
                     }
                 }
             }
+
             None
         });
 
@@ -596,27 +630,23 @@ impl SymbolInterner {
 
         {
             let inner = shard.inner.read();
-            let mut found_text = None;
 
             if let Some(&(_, _, symbol)) =
-                inner
-                    .entries
-                    .find(hash, |&(cand_hash, cand_prefix, symbol)| {
-                        if cand_hash != hash || cand_prefix != prefix {
-                            return false;
-                        }
-
-                        if let Some(text) = shard.strings.get(symbol.index(), self.pool.base_ptr())
-                        {
-                            if text.len() == value.len() && text.as_bytes() == value.as_bytes() {
-                                found_text = Some(text);
-                                return true;
-                            }
-                        }
-                        false
-                    })
+                inner.entries.find(hash, |&(cand_hash, cand_prefix, sym)| {
+                    cand_hash == hash
+                        && cand_prefix == prefix
+                        && shard
+                            .strings
+                            .get(sym.index(), self.pool.base_ptr())
+                            .map(|s| s.as_bytes())
+                            == Some(value.as_bytes())
+                })
             {
-                resolved = Some((found_text.unwrap(), symbol));
+                let text = shard
+                    .strings
+                    .get(symbol.index(), self.pool.base_ptr())
+                    .unwrap();
+                resolved = Some((text, symbol));
             }
         }
 
@@ -662,13 +692,28 @@ impl SymbolInterner {
 
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
-        LOCAL_CACHE.with(|cache| {
-            cache.entries[cache_index].set(Some(CacheEntry {
-                interner_id: self.interner_id,
-                offset,
-                hash: hash_trunc,
-                symbol,
-            }));
+        LOCAL_CACHE.with(|cell| unsafe {
+            let cache = &mut *cell.get();
+            let mut inserted = false;
+
+            for i in 0..4 {
+                let idx = cache_line_base + i;
+                if cache.interner_ids[idx] == 0 {
+                    cache.interner_ids[idx] = self.interner_id;
+                    cache.hashes[idx] = hash_trunc;
+                    cache.offsets[idx] = offset;
+                    cache.symbols[idx] = symbol.into_raw();
+                    inserted = true;
+                    break;
+                }
+            }
+
+            if !inserted {
+                cache.interner_ids[cache_index] = self.interner_id;
+                cache.hashes[cache_index] = hash_trunc;
+                cache.offsets[cache_index] = offset;
+                cache.symbols[cache_index] = symbol.into_raw();
+            }
         });
 
         symbol
@@ -680,26 +725,28 @@ impl SymbolInterner {
 
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
-        let cache_line_base = ((hash & CACHE_MASK) & !3) as usize;
+        let cache_line_base = cache_index & !3;
 
-        let cached = LOCAL_CACHE.with(|cache| {
+        let cached = LOCAL_CACHE.with(|cell| unsafe {
+            let cache = &mut *cell.get();
+
             for i in 0..4 {
-                if let Some(entry) = cache.entries[cache_line_base + i].get() {
-                    if entry.interner_id == self.interner_id && entry.hash == hash_trunc {
-                        let ptr = unsafe { self.pool.base_ptr().add(entry.offset as usize) };
-                        let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
-                        let cached_value = unsafe {
-                            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                                ptr.add(4),
-                                len,
-                            ))
-                        };
-                        if cached_value == value {
-                            return Some(entry.symbol);
+                let idx = cache_line_base + i;
+
+                if cache.interner_ids[idx] == self.interner_id && cache.hashes[idx] == hash_trunc {
+                    let ptr = self.pool.base_ptr().add(cache.offsets[idx] as usize);
+                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
+                    let cached_len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+
+                    if cached_len == len {
+                        let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                        if cached_value == value.as_bytes() {
+                            return Some(Symbol::from_raw(cache.symbols[idx]).unwrap());
                         }
                     }
                 }
             }
+
             None
         });
 
@@ -725,13 +772,28 @@ impl SymbolInterner {
 
         let offset = (text.as_ptr() as usize - self.pool.base_ptr() as usize) as u32;
 
-        LOCAL_CACHE.with(|cache| {
-            cache.entries[cache_index].set(Some(CacheEntry {
-                interner_id: self.interner_id,
-                offset,
-                hash: hash_trunc,
-                symbol,
-            }));
+        LOCAL_CACHE.with(|cell| unsafe {
+            let cache = &mut *cell.get();
+            let mut inserted = false;
+
+            for i in 0..4 {
+                let idx = cache_line_base + i;
+                if cache.interner_ids[idx] == 0 {
+                    cache.interner_ids[idx] = self.interner_id;
+                    cache.hashes[idx] = hash_trunc;
+                    cache.offsets[idx] = offset;
+                    cache.symbols[idx] = symbol.into_raw();
+                    inserted = true;
+                    break;
+                }
+            }
+
+            if !inserted {
+                cache.interner_ids[cache_index] = self.interner_id;
+                cache.hashes[cache_index] = hash_trunc;
+                cache.offsets[cache_index] = offset;
+                cache.symbols[cache_index] = symbol.into_raw();
+            }
         });
 
         Some(symbol)
@@ -739,6 +801,17 @@ impl SymbolInterner {
 
     pub fn resolve(&self, symbol: Symbol) -> Option<&str> {
         let shard_id = symbol.shard_id();
+        let index = symbol.index();
+
+        if shard_id == STATIC_SHARD_ID as usize {
+            if index == 0 {
+                return Some("");
+            }
+            if index <= 128 {
+                return Some(ASCII_STRINGS[index - 1]);
+            }
+            return None;
+        }
 
         if shard_id >= self.shards.len() {
             return None;
@@ -746,15 +819,24 @@ impl SymbolInterner {
 
         self.shards[shard_id]
             .strings
-            .get(symbol.index(), self.pool.base_ptr())
+            .get(index, self.pool.base_ptr())
     }
 
+    #[inline(always)]
     pub unsafe fn resolve_unchecked(&self, symbol: Symbol) -> &str {
+        let shard_id = symbol.shard_id();
+        let index = symbol.index();
         unsafe {
-            let shard = self.shards.get_unchecked(symbol.shard_id());
-            shard
-                .strings
-                .get_unchecked(symbol.index(), self.pool.base_ptr())
+            if shard_id == STATIC_SHARD_ID as usize {
+                return if index == 0 {
+                    ""
+                } else {
+                    *ASCII_STRINGS.get_unchecked(index - 1)
+                };
+            }
+
+            let shard = self.shards.get_unchecked(shard_id);
+            shard.strings.get_unchecked(index, self.pool.base_ptr())
         }
     }
 
