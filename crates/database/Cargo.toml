@@ -13,3 +13,10 @@ ahash.workspace = true
 hashbrown.workspace = true
 parking_lot.workspace = true
 rustc-hash.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "interner_benchmarks"
+harness = false

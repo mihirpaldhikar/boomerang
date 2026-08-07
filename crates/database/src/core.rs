@@ -25,4 +25,4 @@ mod value;
 mod schema;
 
 pub use string_interner::StringInterner;
-pub use symbol_interner::SymbolInterner;
+pub use symbol_interner::{SymbolInterner, Symbol};

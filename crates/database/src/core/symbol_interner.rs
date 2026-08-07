@@ -46,8 +46,8 @@ const CHUNK_MASK: usize = CHUNK_SIZE - 1;
 // cover the full 2^24 index space: 2^24 / CHUNK_SIZE chunks.
 const NUM_CHUNKS: usize = 1 << (24 - CHUNK_SHIFT); // 4096
 
-// Default Arena Capacity: 256 MB.
-const ARENA_CAPACITY: u32 = 256 * 1024 * 1024;
+// Default Arena Capacity: 512 MB.
+const ARENA_CAPACITY: u32 = 512 * 1024 * 1024;
 
 static NEXT_INTERNER_ID: AtomicU32 = AtomicU32::new(1);
 
