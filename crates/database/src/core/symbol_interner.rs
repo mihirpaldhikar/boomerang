@@ -240,8 +240,10 @@ struct CacheEntry {
 struct ThreadLocalCache {
     interner_ids: [u32; CACHE_CAPACITY],
     hashes: [u32; CACHE_CAPACITY],
+    lens: [u32; CACHE_CAPACITY],
     offsets: [u32; CACHE_CAPACITY],
     symbols: [u32; CACHE_CAPACITY],
+    prefixes: [u64; CACHE_CAPACITY],
 }
 
 impl ThreadLocalCache {
@@ -249,8 +251,10 @@ impl ThreadLocalCache {
         Self {
             interner_ids: [0; CACHE_CAPACITY],
             hashes: [0; CACHE_CAPACITY],
+            lens: [0; CACHE_CAPACITY],
             offsets: [0; CACHE_CAPACITY],
             symbols: [0; CACHE_CAPACITY],
+            prefixes: [0; CACHE_CAPACITY],
         }
     }
 }
@@ -438,16 +442,30 @@ impl Drop for LockFreeStringArray {
 }
 
 struct ShardInner {
-    entries: HashTable<(u64, u32, Symbol)>,
+    entries: HashTable<(u64, u64, Symbol)>,
 }
 
 impl ShardInner {
     #[inline(always)]
-    fn prefix4(bytes: &[u8]) -> u32 {
-        let mut buf = [0u8; 4];
-        let n = bytes.len().min(4);
-        buf[..n].copy_from_slice(&bytes[..n]);
-        u32::from_ne_bytes(buf) // native-endian: only ever compared, never serialized
+    fn prefix8(bytes: &[u8]) -> u64 {
+        let len = bytes.len();
+        if len >= 8 {
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const u64) }
+        } else if len >= 4 {
+            unsafe {
+                let a = std::ptr::read_unaligned(bytes.as_ptr() as *const u32) as u64;
+                let b = std::ptr::read_unaligned(bytes.as_ptr().add(len - 4) as *const u32) as u64;
+                (b << 32) | a
+            }
+        } else if len >= 2 {
+            unsafe {
+                let a = std::ptr::read_unaligned(bytes.as_ptr() as *const u16) as u64;
+                let b = *bytes.get_unchecked(len - 1) as u64;
+                (b << 16) | a
+            }
+        } else {
+            0
+        }
     }
 }
 
@@ -591,8 +609,12 @@ impl SymbolInterner {
             }
         }
 
-        let hash = self.hash_builder.hash_one(value);
-        let prefix = ShardInner::prefix4(value.as_bytes());
+        let prefix = ShardInner::prefix8(value.as_bytes());
+        let hash = if len <= 8 {
+            prefix.wrapping_mul(0x517cc1b727220a95)
+        } else {
+            self.hash_builder.hash_one(value)
+        };
 
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
@@ -600,20 +622,31 @@ impl SymbolInterner {
 
         let cached = LOCAL_CACHE.with(|cell| unsafe {
             let cache = &mut *cell.get();
+            let mut candidate_idx = usize::MAX;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
+                if cache.interner_ids[idx] == self.interner_id
+                    && cache.hashes[idx] == hash_trunc
+                    && cache.lens[idx] == len as u32
+                    && cache.prefixes[idx] == prefix
+                {
+                    candidate_idx = idx;
+                }
+            }
 
-                if cache.interner_ids[idx] == self.interner_id && cache.hashes[idx] == hash_trunc {
-                    let ptr = self.pool.base_ptr().add(cache.offsets[idx] as usize);
-                    let cached_len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+            if candidate_idx != usize::MAX {
+                if len <= 8 {
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                }
 
-                    if cached_len == len {
-                        let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
-                        if cached_value == value.as_bytes() {
-                            return Some(Symbol::from_raw(cache.symbols[idx]).unwrap());
-                        }
-                    }
+                let ptr = self
+                    .pool
+                    .base_ptr()
+                    .add(cache.offsets[candidate_idx] as usize);
+                let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                if cached_value == value.as_bytes() {
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
                 }
             }
 
@@ -695,14 +728,17 @@ impl SymbolInterner {
         LOCAL_CACHE.with(|cell| unsafe {
             let cache = &mut *cell.get();
             let mut inserted = false;
+            let len_u32 = value.len() as u32;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
                 if cache.interner_ids[idx] == 0 {
                     cache.interner_ids[idx] = self.interner_id;
                     cache.hashes[idx] = hash_trunc;
+                    cache.lens[idx] = len_u32;
                     cache.offsets[idx] = offset;
                     cache.symbols[idx] = symbol.into_raw();
+                    cache.prefixes[idx] = prefix;
                     inserted = true;
                     break;
                 }
@@ -711,8 +747,10 @@ impl SymbolInterner {
             if !inserted {
                 cache.interner_ids[cache_index] = self.interner_id;
                 cache.hashes[cache_index] = hash_trunc;
+                cache.lens[cache_index] = len_u32;
                 cache.offsets[cache_index] = offset;
                 cache.symbols[cache_index] = symbol.into_raw();
+                cache.prefixes[cache_index] = prefix;
             }
         });
 
@@ -720,8 +758,25 @@ impl SymbolInterner {
     }
 
     pub fn get(&self, value: &str) -> Option<Symbol> {
-        let hash = self.hash_builder.hash_one(value);
-        let prefix = ShardInner::prefix4(value.as_bytes());
+        let len = value.len();
+
+        if len == 0 {
+            return Some(Symbol::new(STATIC_SHARD_ID, 0));
+        }
+
+        if len == 1 {
+            let b = value.as_bytes()[0];
+            if b < 128 {
+                return Some(Symbol::new(STATIC_SHARD_ID, (b as usize) + 1));
+            }
+        }
+
+        let prefix = ShardInner::prefix8(value.as_bytes());
+        let hash = if len <= 8 {
+            prefix.wrapping_mul(0x517cc1b727220a95)
+        } else {
+            self.hash_builder.hash_one(value)
+        };
 
         let cache_index = (hash & CACHE_MASK) as usize;
         let hash_trunc = hash as u32;
@@ -729,21 +784,31 @@ impl SymbolInterner {
 
         let cached = LOCAL_CACHE.with(|cell| unsafe {
             let cache = &mut *cell.get();
+            let mut candidate_idx = usize::MAX;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
+                if cache.interner_ids[idx] == self.interner_id
+                    && cache.hashes[idx] == hash_trunc
+                    && cache.lens[idx] == len as u32
+                    && cache.prefixes[idx] == prefix
+                {
+                    candidate_idx = idx;
+                }
+            }
 
-                if cache.interner_ids[idx] == self.interner_id && cache.hashes[idx] == hash_trunc {
-                    let ptr = self.pool.base_ptr().add(cache.offsets[idx] as usize);
-                    let len = unsafe { std::ptr::read_unaligned(ptr as *const u32) as usize };
-                    let cached_len = std::ptr::read_unaligned(ptr as *const u32) as usize;
+            if candidate_idx != usize::MAX {
+                if len <= 8 {
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
+                }
 
-                    if cached_len == len {
-                        let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
-                        if cached_value == value.as_bytes() {
-                            return Some(Symbol::from_raw(cache.symbols[idx]).unwrap());
-                        }
-                    }
+                let ptr = self
+                    .pool
+                    .base_ptr()
+                    .add(cache.offsets[candidate_idx] as usize);
+                let cached_value = std::slice::from_raw_parts(ptr.add(4), len);
+                if cached_value == value.as_bytes() {
+                    return Some(Symbol::from_raw(cache.symbols[candidate_idx]).unwrap());
                 }
             }
 
@@ -775,12 +840,14 @@ impl SymbolInterner {
         LOCAL_CACHE.with(|cell| unsafe {
             let cache = &mut *cell.get();
             let mut inserted = false;
+            let len_u32 = value.len() as u32;
 
             for i in 0..4 {
                 let idx = cache_line_base + i;
                 if cache.interner_ids[idx] == 0 {
                     cache.interner_ids[idx] = self.interner_id;
                     cache.hashes[idx] = hash_trunc;
+                    cache.lens[idx] = len_u32;
                     cache.offsets[idx] = offset;
                     cache.symbols[idx] = symbol.into_raw();
                     inserted = true;
@@ -791,6 +858,7 @@ impl SymbolInterner {
             if !inserted {
                 cache.interner_ids[cache_index] = self.interner_id;
                 cache.hashes[cache_index] = hash_trunc;
+                cache.lens[cache_index] = len_u32;
                 cache.offsets[cache_index] = offset;
                 cache.symbols[cache_index] = symbol.into_raw();
             }
