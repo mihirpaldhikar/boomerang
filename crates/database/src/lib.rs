@@ -19,14 +19,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use std::sync::OnceLock;
+
 
 pub use crate::core::{SymbolInterner, Symbol};
 
 mod core;
-
-pub(crate) fn global_symbol_interner() -> &'static SymbolInterner {
-    static INTERNER: OnceLock<SymbolInterner> = OnceLock::new();
-
-    INTERNER.get_or_init(|| SymbolInterner::with_capacity(1024))
-}

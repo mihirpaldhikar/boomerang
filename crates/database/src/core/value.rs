@@ -21,7 +21,6 @@
  */
 
 use crate::core::symbol_interner::Symbol;
-use crate::global_symbol_interner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -53,83 +52,6 @@ impl ValueType {
     pub fn to_u8(&self) -> u8 {
         // Because of #[repr(u8)], the first byte in memory is always the discriminant
         unsafe { *<*const _>::cast::<u8>(self) }
-    }
-
-    pub fn from_pg_type(pg_type: &str, is_custom: bool) -> Self {
-        if is_custom {
-            return ValueType::Custom(global_symbol_interner().get_or_intern(pg_type));
-        }
-
-        // Clean up the type name (e.g., "character varying(255)" -> "character varying")
-        // and handle arrays attached to modifiers (e.g., "varchar(255)[]" -> "varchar[]")
-        let (base_type, is_array) = if let Some(bracket_idx) = pg_type.find('(') {
-            let base = &pg_type[..bracket_idx];
-            let is_array = pg_type.ends_with("[]");
-            (base.trim_end(), is_array)
-        } else {
-            (pg_type, false)
-        };
-
-        // If it's formatted cleanly as an array ending in "[]", we can match its base.
-        // Otherwise, we match the raw string directly (which catches Postgres internal "_type" arrays).
-        if is_array {
-            return match base_type {
-                "boolean" | "bool" => ValueType::BoolArray,
-                "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" => ValueType::IntArray,
-                "real" | "double precision" | "float4" | "float8" => ValueType::FloatArray,
-                "numeric" | "decimal" => ValueType::DecimalArray,
-                "text" | "character varying" | "varchar" | "character" | "char" | "name"
-                | "bpchar" => ValueType::TextArray,
-                _ => ValueType::Custom(global_symbol_interner().get_or_intern(pg_type)),
-            };
-        }
-
-        // Match the base type
-        match base_type {
-            // Booleans
-            "boolean" | "bool" => ValueType::Bool,
-
-            // Integers
-            "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" | "serial"
-            | "bigserial" | "smallserial" | "oid" => ValueType::Int,
-
-            // Floats
-            "real" | "double precision" | "float4" | "float8" => ValueType::Float,
-
-            // Decimals
-            "numeric" | "decimal" => ValueType::Decimal,
-
-            // Text
-            "text" | "character varying" | "varchar" | "character" | "char" | "name" | "bpchar" => {
-                ValueType::Text
-            }
-
-            // Binary
-            "bytea" => ValueType::Blob,
-
-            // JSON
-            "json" | "jsonb" => ValueType::Json,
-
-            // UUID
-            "uuid" => ValueType::Uuid,
-
-            // Date / Time
-            "timestamp without time zone" | "timestamp" => ValueType::Timestamp,
-            "timestamp with time zone" | "timestamptz" => ValueType::TimestampTz,
-            "date" => ValueType::Date,
-            "time without time zone" | "time" => ValueType::Time,
-            "time with time zone" | "timetz" => ValueType::TimeTz,
-
-            // Internal pg_type names use an underscore prefix for arrays (e.g. "_int4")
-            "_bool" => ValueType::BoolArray,
-            "_int2" | "_int4" | "_int8" | "_oid" => ValueType::IntArray,
-            "_float4" | "_float8" => ValueType::FloatArray,
-            "_numeric" => ValueType::DecimalArray,
-            "_text" | "_varchar" | "_bpchar" | "_name" => ValueType::TextArray,
-
-            // Fallback for unmapped Postgres types (e.g. inet, macaddr, point, xml, arrays of json, etc.)
-            _ => ValueType::Custom(global_symbol_interner().get_or_intern(pg_type)),
-        }
     }
 }
 

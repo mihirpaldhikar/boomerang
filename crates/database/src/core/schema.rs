@@ -19,9 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+use crate::SymbolInterner;
 use crate::core::symbol_interner::Symbol;
 use crate::core::value::ValueType;
-use crate::global_symbol_interner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -76,6 +76,7 @@ impl From<Action> for u16 {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
     pub(crate) constraint_name: Symbol,
     pub(crate) namespace: Symbol,
@@ -164,6 +165,7 @@ impl PoolRange {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct Column {
     pub(crate) name: Symbol,
     pub(crate) data_type: ValueType,
@@ -174,12 +176,6 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn name(&self) -> &str {
-        crate::global_symbol_interner()
-            .resolve(self.name)
-            .expect("column symbol not from global interner")
-    }
-
     #[inline]
     pub fn name_symbol(&self) -> Symbol {
         self.name
@@ -229,6 +225,68 @@ pub struct DatabaseSchema {
     pub(crate) constraint_pool: Box<[Symbol]>,
     pub(crate) foreign_key_pool: Box<[ForeignKey]>,
     pub(crate) hash: [u8; 32],
+    pub(crate) interner: SymbolInterner,
+}
+
+#[derive(Clone, Copy)]
+pub struct ColumnRef<'a> {
+    pub(crate) schema: &'a DatabaseSchema,
+    pub(crate) index: usize,
+}
+
+impl<'a> ColumnRef<'a> {
+    #[inline(always)]
+    fn meta(&self) -> &'a Column {
+        &self.schema.columns[self.index]
+    }
+
+    #[inline]
+    pub fn name(&self) -> &'a str {
+        self.schema
+            .interner
+            .resolve(self.meta().name)
+            .expect("column symbol not from the schema")
+    }
+
+    #[inline]
+    pub fn name_symbol(&self) -> Symbol {
+        self.meta().name
+    }
+
+    #[inline]
+    pub fn data_type(&self) -> &ValueType {
+        &self.meta().data_type
+    }
+
+    #[inline]
+    pub fn default_value(&self) -> Option<Symbol> {
+        self.meta().default_value
+    }
+
+    #[inline]
+    pub fn is_nullable(&self) -> bool {
+        self.meta().is_nullable()
+    }
+
+    #[inline]
+    pub fn is_primary_key(&self) -> bool {
+        self.meta().is_primary_key()
+    }
+
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        self.meta().is_unique()
+    }
+
+    #[inline]
+    pub fn constraints(&self) -> &'a [Symbol] {
+        &self.schema.constraint_pool[self.meta().constraints.as_range()]
+    }
+
+    #[inline]
+    pub fn foreign_keys(&self) -> &'a [ForeignKey] {
+        &self.schema.foreign_key_pool[self.meta().foreign_keys.as_range()]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,9 +308,10 @@ impl<'a> TableRef<'a> {
     }
 
     pub fn name(&self) -> &'a str {
-        global_symbol_interner()
+        self.schema
+            .interner
             .resolve(self.meta().name)
-            .expect("table symbol not from global interner")
+            .expect("table symbol not from the schema")
     }
 
     #[inline]
@@ -266,8 +325,10 @@ impl<'a> TableRef<'a> {
     }
 
     #[inline]
-    pub fn columns(&self) -> &'a [Column] {
-        &self.schema.columns[self.columns_range()]
+    pub fn columns(&self) -> impl ExactSizeIterator<Item = ColumnRef<'a>> {
+        let schema = self.schema;
+        self.columns_range()
+            .map(move |index| ColumnRef { schema, index })
     }
 
     #[inline]
@@ -280,34 +341,31 @@ impl<'a> TableRef<'a> {
         self.column_names().iter().position(|&c| c == name)
     }
 
-    pub fn column(&self, name: &str) -> Option<&'a Column> {
-        let symbol = global_symbol_interner().get(name)?;
+    pub fn column(&self, name: &str) -> Option<ColumnRef<'a>> {
+        let symbol = self.schema.interner.get(name)?;
         self.column_by_symbol(symbol)
     }
 
     #[inline]
-    pub fn column_by_symbol(&self, name: Symbol) -> Option<&'a Column> {
-        Some(&self.columns()[self.position(name)?])
+    pub fn column_by_symbol(&self, name: Symbol) -> Option<ColumnRef<'a>> {
+        let local_index = self.position(name)?;
+        Some(ColumnRef {
+            schema: self.schema,
+            index: self.columns_range().start + local_index,
+        })
     }
 
-    pub fn primary_key(&self) -> Option<&'a Column> {
-        self.meta().primary_key.map(|i| &self.columns()[i as usize])
+    pub fn primary_key(&self) -> Option<ColumnRef<'a>> {
+        self.meta().primary_key.map(|i| ColumnRef {
+            schema: self.schema,
+            index: self.columns_range().start + i as usize,
+        })
     }
 
     #[inline]
     pub fn foreign_keys(&self) -> &'a [ForeignKey] {
         let m = self.meta();
         &self.schema.foreign_key_pool[m.fk_start as usize..m.fk_start as usize + m.fk_len as usize]
-    }
-
-    #[inline]
-    pub fn constraints_of(&self, column: &Column) -> &'a [Symbol] {
-        &self.schema.constraint_pool[column.constraints.as_range()]
-    }
-
-    #[inline]
-    pub fn foreign_keys_of(&self, column: &Column) -> &'a [ForeignKey] {
-        &self.schema.foreign_key_pool[column.foreign_keys.as_range()]
     }
 
     #[inline]
@@ -320,6 +378,10 @@ impl<'a> TableRef<'a> {
 }
 
 impl DatabaseSchema {
+    #[inline(always)]
+    pub fn resolve_symbol(&self, symbol: Symbol) -> Option<&str> {
+        self.interner.resolve(symbol)
+    }
     #[inline]
     pub fn len(&self) -> usize {
         self.tables.len()
@@ -346,7 +408,7 @@ impl DatabaseSchema {
     }
 
     pub fn table(&self, name: &str) -> Option<TableRef<'_>> {
-        let symbol = global_symbol_interner().get(name)?;
+        let symbol = self.interner.get(name)?;
         self.table_by_symbol(symbol)
     }
 
