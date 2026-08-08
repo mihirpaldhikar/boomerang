@@ -20,6 +20,7 @@
  * SOFTWARE.
  */
 use crate::SymbolInterner;
+use crate::core::schema_builder::DatabaseSchemaBuilder;
 use crate::core::symbol_interner::Symbol;
 use crate::core::value::ValueType;
 
@@ -378,6 +379,10 @@ impl<'a> TableRef<'a> {
 }
 
 impl DatabaseSchema {
+    pub fn new(total_tables: usize, total_columns: usize) -> DatabaseSchemaBuilder {
+        DatabaseSchemaBuilder::with_capacity(total_tables, total_columns)
+    }
+    
     #[inline(always)]
     pub fn resolve_symbol(&self, symbol: Symbol) -> Option<&str> {
         self.interner.resolve(symbol)
