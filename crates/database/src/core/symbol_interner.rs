@@ -649,6 +649,37 @@ impl SymbolInterner {
         interner
     }
 
+    pub unsafe fn from_bytes_unchecked(bytes: &[u8]) -> Self {
+        let shard_count =
+            MemoryPool::read_shard_count_header(bytes).unwrap_or(DEFAULT_SHARD_COUNT as u32);
+        let estimated_symbols = bytes.len() / 16;
+
+        let interner = Self::with_capacity_and_shards(estimated_symbols, shard_count as usize);
+
+        if bytes.len() <= 4 {
+            return interner;
+        }
+
+        let mut cursor = 4;
+        while cursor + 4 <= bytes.len() {
+            let len_bytes: [u8; 4] = bytes[cursor..cursor + 4].try_into().unwrap();
+            let len = u32::from_le_bytes(len_bytes) as usize;
+
+            if cursor + 4 + len > bytes.len() {
+                break;
+            }
+
+            let str_slice = &bytes[cursor + 4..cursor + 4 + len];
+
+            let text = unsafe { std::str::from_utf8_unchecked(str_slice) };
+            interner.insert_unique(text);
+
+            cursor += padded_record_size(len as u32) as usize;
+        }
+
+        interner
+    }
+
     fn insert_unique(&self, value: &str) -> Symbol {
         let len = value.len();
         if len == 0 {
