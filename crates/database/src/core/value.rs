@@ -20,7 +20,7 @@
  * SOFTWARE.
  */
 
-use crate::core::symbol_interner::Symbol;
+use crate::core::string_interner::Symbol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]

@@ -19,9 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use crate::SymbolInterner;
+use crate::StringInterner;
 use crate::core::schema_builder::DatabaseSchemaBuilder;
-use crate::core::symbol_interner::Symbol;
+use crate::core::string_interner::Symbol;
 use crate::core::value::ValueType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -244,7 +244,7 @@ pub struct DatabaseSchema {
     pub(crate) constraint_pool: Box<[Symbol]>,
     pub(crate) foreign_key_pool: Box<[ForeignKey]>,
     pub(crate) hash: [u8; 32],
-    pub(crate) interner: SymbolInterner,
+    pub(crate) interner: StringInterner,
 }
 
 #[derive(Clone, Copy)]
@@ -631,7 +631,7 @@ impl DatabaseSchema {
 
         let interner_len = read_u32!() as usize;
         let interner_bytes = read_bytes!(interner_len);
-        let interner = SymbolInterner::from_bytes(interner_bytes);
+        let interner = StringInterner::from_bytes(interner_bytes);
 
         let tables_len = read_u32!();
         let mut tables = Vec::with_capacity(tables_len as usize);
@@ -802,7 +802,7 @@ impl DatabaseSchema {
             let interner_bytes = std::slice::from_raw_parts(ptr, interner_len);
             ptr = ptr.add(interner_len);
 
-            let interner = SymbolInterner::from_bytes_unchecked(interner_bytes);
+            let interner = StringInterner::from_bytes_unchecked(interner_bytes);
 
             let tables = read_vec!(
                 TableMeta,

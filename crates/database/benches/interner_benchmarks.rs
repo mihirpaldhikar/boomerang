@@ -21,7 +21,7 @@
  */
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use database::{Symbol, SymbolInterner};
+use database::{StringInterner, Symbol};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::thread;
@@ -63,7 +63,7 @@ fn unicode_of_approx_len(byte_len: usize) -> String {
 // 1. Fast paths
 
 fn bench_fast_paths(c: &mut Criterion) {
-    let interner = SymbolInterner::new();
+    let interner = StringInterner::new();
     let sym_hello = interner.get_or_intern("hello");
     let _sym_world = interner.get_or_intern("world");
     let sym_static = interner.get_or_intern("a");
@@ -100,7 +100,7 @@ fn bench_miss_path(c: &mut Criterion) {
 
     group.bench_function("intern_unique_cold_interner", |b| {
         b.iter_batched(
-            || (SymbolInterner::new(), unique_strings(1, 12)),
+            || (StringInterner::new(), unique_strings(1, 12)),
             |(interner, strings)| {
                 black_box(interner.get_or_intern(&strings[0]));
             },
@@ -109,7 +109,7 @@ fn bench_miss_path(c: &mut Criterion) {
     });
 
     group.bench_function("intern_unique_warm_interner", |b| {
-        let interner = SymbolInterner::new();
+        let interner = StringInterner::new();
         for s in unique_strings(10_000, 12) {
             interner.get_or_intern(&s);
         }
@@ -130,7 +130,7 @@ fn bench_miss_path(c: &mut Criterion) {
 // 3. Resolve edge cases
 
 fn bench_resolve_edges(c: &mut Criterion) {
-    let interner = SymbolInterner::new();
+    let interner = StringInterner::new();
 
     let sym_first = interner.get_or_intern("first_symbol_ever");
     let sym_empty = interner.get_or_intern("");
@@ -166,7 +166,7 @@ fn bench_length_sweep(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(len as u64));
 
         group.bench_with_input(BenchmarkId::new("cache_hit", len), &len, |b, &len| {
-            let interner = SymbolInterner::new();
+            let interner = StringInterner::new();
             let s = ascii_of_len(len);
             interner.get_or_intern(&s);
             b.iter(|| interner.get_or_intern(black_box(&s)))
@@ -175,7 +175,7 @@ fn bench_length_sweep(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("cold_unique", len), &len, |b, &len| {
             b.iter_batched(
                 || {
-                    let interner = SymbolInterner::new();
+                    let interner = StringInterner::new();
                     interner.get_or_intern("warmup_throwaway_key"); // untimed: pays lazy-init cost here, not in the routine
                     let s = ascii_of_len(len);
                     (interner, s)
@@ -202,7 +202,7 @@ fn bench_unicode(c: &mut Criterion) {
             BenchmarkId::new("intern_repeat_utf8", s.len()),
             &s,
             |b, s| {
-                let interner = SymbolInterner::new();
+                let interner = StringInterner::new();
                 interner.get_or_intern(s);
                 b.iter(|| interner.get_or_intern(black_box(s)))
             },
@@ -210,7 +210,7 @@ fn bench_unicode(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("intern_cold_utf8", s.len()), &s, |b, s| {
             b.iter_batched(
-                SymbolInterner::new,
+                StringInterner::new,
                 |interner| black_box(interner.get_or_intern(s)),
                 BatchSize::SmallInput,
             )
@@ -231,7 +231,7 @@ fn bench_duplicate_ratio(c: &mut Criterion) {
             BenchmarkId::new("mixed_workload", ratio_pct),
             &ratio_pct,
             |b, &ratio_pct| {
-                let interner = SymbolInterner::new();
+                let interner = StringInterner::new();
                 let hot_pool = unique_strings(64, 16);
                 for s in &hot_pool {
                     interner.get_or_intern(s);
@@ -271,7 +271,7 @@ fn bench_bulk_growth(c: &mut Criterion) {
             b.iter_batched(
                 || unique_strings(n, 16),
                 |strings| {
-                    let interner = SymbolInterner::new();
+                    let interner = StringInterner::new();
                     for s in &strings {
                         black_box(interner.get_or_intern(s));
                     }
@@ -295,7 +295,7 @@ fn bench_concurrent(c: &mut Criterion) {
             BenchmarkId::new("same_key_contention", n_threads),
             &n_threads,
             |b, &n_threads| {
-                let interner = Arc::new(SymbolInterner::new());
+                let interner = Arc::new(StringInterner::new());
                 interner.get_or_intern("contended_key");
 
                 b.iter(|| {
@@ -320,7 +320,7 @@ fn bench_concurrent(c: &mut Criterion) {
             BenchmarkId::new("disjoint_key_scaling", n_threads),
             &n_threads,
             |b, &n_threads| {
-                let interner = Arc::new(SymbolInterner::new());
+                let interner = Arc::new(StringInterner::new());
 
                 b.iter_batched(
                     || {
@@ -369,7 +369,7 @@ fn bench_serialization(c: &mut Criterion) {
     group.sample_size(20);
 
     for &n in &[100usize, 10_000, 100_000] {
-        let interner = SymbolInterner::new();
+        let interner = StringInterner::new();
         for s in unique_strings(n, 16) {
             interner.get_or_intern(&s);
         }
@@ -384,20 +384,20 @@ fn bench_serialization(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("from_bytes_decode", n), &n, |b, _| {
             b.iter(|| {
-                black_box(SymbolInterner::from_bytes(black_box(&serialized)));
+                black_box(StringInterner::from_bytes(black_box(&serialized)));
             })
         });
 
         group.bench_with_input(BenchmarkId::new("round_trip", n), &n, |b, _| {
             b.iter(|| {
                 let bytes = interner.bytes().to_vec();
-                black_box(SymbolInterner::from_bytes(black_box(&bytes)));
+                black_box(StringInterner::from_bytes(black_box(&bytes)));
             })
         });
     }
 
     group.bench_function("decode_then_resolve_one", |b| {
-        let interner = SymbolInterner::new();
+        let interner = StringInterner::new();
         let syms: Vec<Symbol> = unique_strings(50_000, 16)
             .into_iter()
             .map(|s| interner.get_or_intern(&s))
@@ -406,7 +406,7 @@ fn bench_serialization(c: &mut Criterion) {
         let target = syms[syms.len() / 2];
 
         b.iter(|| {
-            let decoded = SymbolInterner::from_bytes(black_box(&bytes));
+            let decoded = StringInterner::from_bytes(black_box(&bytes));
             black_box(decoded.resolve(black_box(target)));
         })
     });

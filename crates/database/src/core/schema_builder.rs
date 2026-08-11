@@ -23,7 +23,7 @@ use crate::core::schema::{
     Action, Column, ColumnFlags, DatabaseSchema, ForeignKey, PoolRange, TableMeta,
 };
 use crate::core::value::ValueType;
-use crate::{Symbol, SymbolInterner};
+use crate::{StringInterner, Symbol};
 use std::collections::VecDeque;
 
 pub struct RawForeignKey<'a> {
@@ -44,7 +44,7 @@ struct UnresolvedFk {
 
 #[derive(Default)]
 pub struct DatabaseSchemaBuilder {
-    interner: SymbolInterner,
+    interner: StringInterner,
     tables: Vec<TableMeta>,
     columns: Vec<Column>,
     column_names: Vec<Symbol>,
@@ -64,7 +64,7 @@ pub struct DatabaseSchemaBuilder {
 impl DatabaseSchemaBuilder {
     pub(crate) fn with_capacity(tables_cap: usize, columns_cap: usize) -> Self {
         Self {
-            interner: SymbolInterner::with_capacity(columns_cap + tables_cap),
+            interner: StringInterner::with_capacity(columns_cap + tables_cap),
             tables: Vec::with_capacity(tables_cap),
             columns: Vec::with_capacity(columns_cap),
             column_names: Vec::with_capacity(columns_cap),

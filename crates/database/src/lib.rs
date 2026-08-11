@@ -20,7 +20,6 @@
  * SOFTWARE.
  */
 
-
-pub use crate::core::{SymbolInterner, Symbol};
+pub use crate::core::{StringInterner, Symbol};
 
 mod core;

@@ -20,10 +20,8 @@
  * SOFTWARE.
  */
 mod string_interner;
-mod symbol_interner;
 mod value;
 mod schema;
 mod schema_builder;
 
-pub use string_interner::StringInterner;
-pub use symbol_interner::{SymbolInterner, Symbol};
+pub use string_interner::{StringInterner, Symbol};
