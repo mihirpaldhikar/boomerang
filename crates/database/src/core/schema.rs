@@ -77,6 +77,24 @@ impl From<Action> for u16 {
     }
 }
 
+impl From<i16> for Action {
+    fn from(value: i16) -> Self {
+        Self::from(value as u8)
+    }
+}
+
+impl From<Action> for i16 {
+    fn from(value: Action) -> Self {
+        match value {
+            Action::NoAction => 0,
+            Action::Cascade => 1,
+            Action::SetNull => 2,
+            Action::SetDefault => 3,
+            Action::Restrict => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ForeignKey {
     pub(crate) constraint_name: Symbol,
@@ -382,7 +400,7 @@ impl DatabaseSchema {
     pub fn new(total_tables: usize, total_columns: usize) -> DatabaseSchemaBuilder {
         DatabaseSchemaBuilder::with_capacity(total_tables, total_columns)
     }
-    
+
     #[inline(always)]
     pub fn resolve_symbol(&self, symbol: Symbol) -> Option<&str> {
         self.interner.resolve(symbol)
@@ -454,5 +472,423 @@ impl DatabaseSchema {
     #[inline]
     pub fn hash(&self) -> &[u8; 32] {
         &self.hash
+    }
+}
+
+impl DatabaseSchema {
+    pub fn encode(&self) -> Vec<u8> {
+        let interner_bytes = self.interner.bytes();
+
+        let mut estimated_cap = 32 // hash
+            + 4 + interner_bytes.len() // interner
+            + 4 + self.tables.len() * 18 // tables
+            + 4 + self.by_name.len() * 2 // by_name
+            + 4 + self.column_names.len() * 4 // column_names
+            + 4 + self.constraint_pool.len() * 4 // constraint_pool
+            + 4 + self.foreign_key_pool.len() * 14; // foreign_keys
+
+        estimated_cap += 4 + self.columns.len() * 32;
+
+        let mut buf = Vec::with_capacity(estimated_cap);
+
+        buf.extend_from_slice(&self.hash);
+
+        buf.extend_from_slice(&(interner_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&interner_bytes);
+
+        macro_rules! write_u32 {
+            ($val:expr) => {
+                buf.extend_from_slice(&($val as u32).to_le_bytes())
+            };
+        }
+        macro_rules! write_u16 {
+            ($val:expr) => {
+                buf.extend_from_slice(&($val as u16).to_le_bytes())
+            };
+        }
+        macro_rules! write_u8 {
+            ($val:expr) => {
+                buf.push($val as u8)
+            };
+        }
+        macro_rules! write_sym {
+            ($sym:expr) => {
+                write_u32!($sym.into_raw())
+            };
+        }
+        macro_rules! write_sym_opt {
+            ($sym:expr) => {
+                match $sym {
+                    Some(s) => write_u32!(s.into_raw()),
+                    None => write_u32!(0), // 0 is invalid for NonZeroU32, safe marker
+                }
+            };
+        }
+
+        write_u32!(self.tables.len());
+        for t in self.tables.iter() {
+            write_sym!(t.name);
+            write_u32!(t.columns_start);
+            write_u16!(t.columns_len);
+            write_u16!(t.primary_key.unwrap_or(u16::MAX));
+            write_u32!(t.fk_start);
+            write_u16!(t.fk_len);
+        }
+
+        write_u32!(self.by_name.len());
+        for &idx in self.by_name.iter() {
+            write_u16!(idx);
+        }
+
+        write_u32!(self.columns.len());
+        for c in self.columns.iter() {
+            write_sym!(c.name);
+            write_u8!(c.data_type.to_u8());
+
+            if let ValueType::Custom(sym) = c.data_type {
+                write_sym!(sym);
+            }
+
+            write_sym_opt!(c.default_value);
+            write_u8!(c.flags.0);
+            write_u32!(c.constraints.start);
+            write_u16!(c.constraints.len);
+            write_u32!(c.foreign_keys.start);
+            write_u16!(c.foreign_keys.len);
+        }
+
+        write_u32!(self.column_names.len());
+        for &sym in self.column_names.iter() {
+            write_sym!(sym);
+        }
+
+        write_u32!(self.constraint_pool.len());
+        for &sym in self.constraint_pool.iter() {
+            write_sym!(sym);
+        }
+
+        write_u32!(self.foreign_key_pool.len());
+        for fk in self.foreign_key_pool.iter() {
+            write_sym!(fk.constraint_name);
+            write_sym!(fk.namespace);
+            write_u16!(fk.table);
+            write_u16!(fk.column);
+            write_u8!(fk.on_update);
+            write_u8!(fk.on_delete);
+        }
+
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut ptr = 0;
+        let buf = bytes;
+
+        macro_rules! read_bytes {
+            ($len:expr) => {{
+                if ptr + $len > buf.len() {
+                    return None;
+                }
+                let slice = &buf[ptr..ptr + $len];
+                ptr += $len;
+                slice
+            }};
+        }
+        macro_rules! read_u32 {
+            () => {
+                u32::from_le_bytes(read_bytes!(4).try_into().unwrap())
+            };
+        }
+        macro_rules! read_u16 {
+            () => {
+                u16::from_le_bytes(read_bytes!(2).try_into().unwrap())
+            };
+        }
+        macro_rules! read_u8 {
+            () => {
+                read_bytes!(1)[0]
+            };
+        }
+
+        macro_rules! read_sym {
+            () => {
+                Symbol::from_raw(read_u32!())?
+            };
+        }
+        macro_rules! read_sym_opt {
+            () => {{
+                let raw = read_u32!();
+                if raw == 0 {
+                    None
+                } else {
+                    Symbol::from_raw(raw)
+                }
+            }};
+        }
+
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(read_bytes!(32));
+
+        let interner_len = read_u32!() as usize;
+        let interner_bytes = read_bytes!(interner_len);
+        let interner = SymbolInterner::from_bytes(interner_bytes);
+
+        let tables_len = read_u32!();
+        let mut tables = Vec::with_capacity(tables_len as usize);
+        for _ in 0..tables_len {
+            tables.push(TableMeta {
+                name: read_sym!(),
+                columns_start: read_u32!(),
+                columns_len: read_u16!(),
+                primary_key: {
+                    let v = read_u16!();
+                    if v == u16::MAX { None } else { Some(v) }
+                },
+                fk_start: read_u32!(),
+                fk_len: read_u16!(),
+            });
+        }
+
+        let by_name_len = read_u32!();
+        let mut by_name = Vec::with_capacity(by_name_len as usize);
+        for _ in 0..by_name_len {
+            by_name.push(read_u16!());
+        }
+
+        let columns_len = read_u32!();
+        let mut columns = Vec::with_capacity(columns_len as usize);
+        for _ in 0..columns_len {
+            let name = read_sym!();
+            let dt_tag = read_u8!();
+
+            let data_type = match dt_tag {
+                0 => ValueType::Null,
+                1 => ValueType::Bool,
+                2 => ValueType::Int,
+                3 => ValueType::Float,
+                4 => ValueType::Decimal,
+                5 => ValueType::Text,
+                6 => ValueType::Blob,
+                7 => ValueType::Json,
+                8 => ValueType::Uuid,
+                9 => ValueType::Timestamp,
+                10 => ValueType::TimestampTz,
+                11 => ValueType::Date,
+                12 => ValueType::Time,
+                13 => ValueType::TimeTz,
+                14 => ValueType::Custom(read_sym!()),
+                15 => ValueType::BoolArray,
+                16 => ValueType::IntArray,
+                17 => ValueType::FloatArray,
+                18 => ValueType::DecimalArray,
+                19 => ValueType::TextArray,
+                _ => return None,
+            };
+
+            columns.push(Column {
+                name,
+                data_type,
+                default_value: read_sym_opt!(),
+                flags: ColumnFlags::from_bits(read_u8!()),
+                constraints: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
+                foreign_keys: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
+            });
+        }
+
+        let col_names_len = read_u32!();
+        let mut column_names = Vec::with_capacity(col_names_len as usize);
+        for _ in 0..col_names_len {
+            column_names.push(read_sym!());
+        }
+
+        let cpool_len = read_u32!();
+        let mut constraint_pool = Vec::with_capacity(cpool_len as usize);
+        for _ in 0..cpool_len {
+            constraint_pool.push(read_sym!());
+        }
+
+        let fk_len = read_u32!();
+        let mut foreign_key_pool = Vec::with_capacity(fk_len as usize);
+        for _ in 0..fk_len {
+            foreign_key_pool.push(ForeignKey {
+                constraint_name: read_sym!(),
+                namespace: read_sym!(),
+                table: read_u16!(),
+                column: read_u16!(),
+                on_update: Action::from(read_u8!()),
+                on_delete: Action::from(read_u8!()),
+            });
+        }
+
+        Some(DatabaseSchema {
+            interner,
+            tables: tables.into_boxed_slice(),
+            by_name: by_name.into_boxed_slice(),
+            columns: columns.into_boxed_slice(),
+            column_names: column_names.into_boxed_slice(),
+            constraint_pool: constraint_pool.into_boxed_slice(),
+            foreign_key_pool: foreign_key_pool.into_boxed_slice(),
+            hash,
+        })
+    }
+}
+
+impl DatabaseSchema {
+    pub unsafe fn decode_unchecked(bytes: &[u8]) -> Self {
+        unsafe {
+            let mut ptr = bytes.as_ptr();
+
+            macro_rules! read_u32 {
+                () => {{
+                    let val = std::ptr::read_unaligned(ptr.cast::<u32>());
+                    ptr = ptr.add(4);
+                    u32::from_le(val)
+                }};
+            }
+            macro_rules! read_u16 {
+                () => {{
+                    let val = std::ptr::read_unaligned(ptr.cast::<u16>());
+                    ptr = ptr.add(2);
+                    u16::from_le(val)
+                }};
+            }
+            macro_rules! read_u8 {
+                () => {{
+                    let val = *ptr;
+                    ptr = ptr.add(1);
+                    val
+                }};
+            }
+            macro_rules! read_sym {
+                () => {
+                    Symbol::from_raw(read_u32!()).unwrap_unchecked()
+                };
+            }
+            macro_rules! read_sym_opt {
+                () => {{
+                    let raw = read_u32!();
+                    if raw == 0 {
+                        None
+                    } else {
+                        Some(Symbol::from_raw(raw).unwrap_unchecked())
+                    }
+                }};
+            }
+
+            macro_rules! read_vec {
+                ($ty:ty, $len:expr, $block:expr) => {{
+                    let len = $len as usize;
+                    let mut vec: Vec<$ty> = Vec::with_capacity(len);
+                    let vec_ptr = vec.as_mut_ptr();
+                    for i in 0..len {
+                        std::ptr::write(vec_ptr.add(i), $block);
+                    }
+                    vec.set_len(len);
+                    vec.into_boxed_slice()
+                }};
+            }
+
+            let mut hash = [0u8; 32];
+            std::ptr::copy_nonoverlapping(ptr, hash.as_mut_ptr(), 32);
+            ptr = ptr.add(32);
+
+            let interner_len = read_u32!() as usize;
+            let interner_bytes = std::slice::from_raw_parts(ptr, interner_len);
+            ptr = ptr.add(interner_len);
+
+            let interner = SymbolInterner::from_bytes_unchecked(interner_bytes);
+
+            let tables = read_vec!(
+                TableMeta,
+                read_u32!(),
+                TableMeta {
+                    name: read_sym!(),
+                    columns_start: read_u32!(),
+                    columns_len: read_u16!(),
+                    primary_key: {
+                        let v = read_u16!();
+                        if v == u16::MAX { None } else { Some(v) }
+                    },
+                    fk_start: read_u32!(),
+                    fk_len: read_u16!(),
+                }
+            );
+
+            let by_name = read_vec!(u16, read_u32!(), read_u16!());
+
+            let columns = read_vec!(
+                Column,
+                read_u32!(),
+                Column {
+                    name: read_sym!(),
+                    data_type: match read_u8!() {
+                        0 => ValueType::Null,
+                        1 => ValueType::Bool,
+                        2 => ValueType::Int,
+                        3 => ValueType::Float,
+                        4 => ValueType::Decimal,
+                        5 => ValueType::Text,
+                        6 => ValueType::Blob,
+                        7 => ValueType::Json,
+                        8 => ValueType::Uuid,
+                        9 => ValueType::Timestamp,
+                        10 => ValueType::TimestampTz,
+                        11 => ValueType::Date,
+                        12 => ValueType::Time,
+                        13 => ValueType::TimeTz,
+                        14 => ValueType::Custom(read_sym!()),
+                        15 => ValueType::BoolArray,
+                        16 => ValueType::IntArray,
+                        17 => ValueType::FloatArray,
+                        18 => ValueType::DecimalArray,
+                        19 => ValueType::TextArray,
+                        _ => std::hint::unreachable_unchecked(),
+                    },
+                    default_value: read_sym_opt!(),
+                    flags: ColumnFlags::from_bits(read_u8!()),
+                    constraints: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                    foreign_keys: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                }
+            );
+
+            let column_names = read_vec!(Symbol, read_u32!(), read_sym!());
+            let constraint_pool = read_vec!(Symbol, read_u32!(), read_sym!());
+
+            let foreign_key_pool = read_vec!(
+                ForeignKey,
+                read_u32!(),
+                ForeignKey {
+                    constraint_name: read_sym!(),
+                    namespace: read_sym!(),
+                    table: read_u16!(),
+                    column: read_u16!(),
+                    on_update: Action::from(read_u8!()),
+                    on_delete: Action::from(read_u8!()),
+                }
+            );
+
+            DatabaseSchema {
+                interner,
+                tables,
+                by_name,
+                columns,
+                column_names,
+                constraint_pool,
+                foreign_key_pool,
+                hash,
+            }
+        }
     }
 }
