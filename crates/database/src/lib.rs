@@ -20,6 +20,8 @@
  * SOFTWARE.
  */
 
-pub use crate::core::{StringInterner, Symbol};
-
 mod core;
+mod dialect;
+
+pub use crate::core::{StringInterner, Symbol};
+pub use crate::dialect::PostgresDatabase;

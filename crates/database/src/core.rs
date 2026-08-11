@@ -25,3 +25,5 @@ mod schema;
 mod schema_builder;
 
 pub use string_interner::{StringInterner, Symbol};
+pub use schema::{DatabaseSchema, Action};
+pub use schema_builder::{DatabaseSchemaBuilder, RawForeignKey};
