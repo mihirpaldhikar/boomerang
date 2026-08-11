@@ -82,7 +82,7 @@ impl DatabaseSchemaBuilder {
         &mut self,
         table_name: &'a str,
         column_name: &'a str,
-        data_type: ValueType,
+        data_type: &'a str,
         nullable: bool,
         is_primary: bool,
         is_unique: bool,
@@ -146,6 +146,32 @@ impl DatabaseSchemaBuilder {
             });
         }
         let fks_len = (self.foreign_key_pool.len() as u32 - fks_start) as u16;
+
+        let data_type = match data_type {
+            "boolean" | "bool" => ValueType::Bool,
+            "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" | "serial"
+            | "bigserial" | "smallserial" | "oid" => ValueType::Int,
+            "real" | "double precision" | "float4" | "float8" => ValueType::Float,
+            "numeric" | "decimal" => ValueType::Decimal,
+            "text" | "character varying" | "varchar" | "character" | "char" | "name" | "bpchar" => {
+                ValueType::Text
+            }
+            "bytea" => ValueType::Blob,
+            "json" | "jsonb" => ValueType::Json,
+            "uuid" => ValueType::Uuid,
+            "timestamp without time zone" | "timestamp" => ValueType::Timestamp,
+            "timestamp with time zone" | "timestamptz" => ValueType::TimestampTz,
+            "date" => ValueType::Date,
+            "time without time zone" | "time" => ValueType::Time,
+            "time with time zone" | "timetz" => ValueType::TimeTz,
+
+            "_bool" => ValueType::BoolArray,
+            "_int2" | "_int4" | "_int8" | "_oid" => ValueType::IntArray,
+            "_float4" | "_float8" => ValueType::FloatArray,
+            "_numeric" => ValueType::DecimalArray,
+            "_text" | "_varchar" | "_bpchar" | "_name" => ValueType::TextArray,
+            _ => ValueType::Custom(self.interner.get_or_intern(data_type)),
+        };
 
         self.columns.push(Column {
             name: col_sym,
