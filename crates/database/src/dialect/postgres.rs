@@ -22,7 +22,28 @@
 use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, RawForeignKey};
 use futures::TryStreamExt;
 use sqlx::postgres::PgPoolOptions;
+use std::fmt;
+use std::fmt::Formatter;
 use std::sync::Arc;
+
+const DATABASE_SCHEMA_QUERY: &'static str = include_str!("../../../../sql/database_schema.sql");
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum PostgresDatabaseError {
+    InitialChecksFailed,
+    SetupFailed { reason: String },
+}
+
+impl fmt::Display for PostgresDatabaseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PostgresDatabaseError::InitialChecksFailed => write!(f, "Initial checks failed"),
+            PostgresDatabaseError::SetupFailed { reason } => write!(f, "Setup failed: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for PostgresDatabaseError {}
 
 pub struct PostgresDatabase {
     pool: sqlx::Pool<sqlx::Postgres>,
@@ -39,15 +60,21 @@ impl Clone for PostgresDatabase {
 }
 
 impl PostgresDatabase {
-    // TODO: Must return Result.
-    pub async fn new(connection_url: &str) -> Self {
+    pub async fn new(connection_url: &str) -> Result<Self, PostgresDatabaseError> {
         let pool = PgPoolOptions::new().connect(connection_url).await.unwrap();
+
+        let setup_exists = Self::perform_checks(pool.clone()).await?;
+
+        if !setup_exists {
+            Self::perform_setup(pool.clone()).await?;
+        }
+
         let schema = Self::load_schema(pool.clone()).await.unwrap();
 
-        Self {
+        Ok(Self {
             pool,
             schema: Arc::new(schema),
-        }
+        })
     }
 
     pub fn schema(&self) -> &DatabaseSchema {
@@ -56,9 +83,42 @@ impl PostgresDatabase {
 }
 
 impl PostgresDatabase {
+    async fn perform_checks(
+        pool: sqlx::Pool<sqlx::Postgres>,
+    ) -> Result<bool, PostgresDatabaseError> {
+        match sqlx::query_scalar(
+            r#"
+            SELECT count(p.proname) = 1
+            FROM pg_catalog.pg_namespace n
+                     JOIN
+                 pg_catalog.pg_proc p ON
+                     p.pronamespace = n.oid
+            WHERE p.prokind = 'f'
+              AND n.nspname = 'boomerang'
+              AND p.proname = 'database_schema';
+        "#,
+        )
+        .fetch_one(&pool)
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(_) => Err(PostgresDatabaseError::InitialChecksFailed),
+        }
+    }
+
+    async fn perform_setup(pool: sqlx::Pool<sqlx::Postgres>) -> Result<(), PostgresDatabaseError> {
+        if let Err(r) = sqlx::raw_sql(DATABASE_SCHEMA_QUERY).execute(&pool).await {
+            return Err(PostgresDatabaseError::SetupFailed {
+                reason: r.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     async fn load_schema(pool: sqlx::Pool<sqlx::Postgres>) -> Result<DatabaseSchema, sqlx::Error> {
         let mut rows =
-            sqlx::query("SELECT * FROM database_schema('public') ORDER BY table_name, attnum;")
+            sqlx::query("SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;")
                 .fetch(&pool);
 
         let mut builder = DatabaseSchemaBuilder::with_capacity(200, 2000);
