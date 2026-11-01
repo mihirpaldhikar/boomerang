@@ -165,17 +165,16 @@ impl PostgresDatabase {
 
         if let Err(r) = sqlx::raw_sql(
             r#"
-                    CREATE TABLE IF NOT EXISTS boomerang.sync_log
-                    (
-                        table_name text    NOT NULL,
-                        record_id  text    NOT NULL,
-                        op_type    char(1) NOT NULL CHECK (op_type IN ('I', 'U', 'D')),
-                        version    bigint  NOT NULL DEFAULT 1,
-                        updated_at bigint  NOT NULL,
-                        CONSTRAINT sync_log_pkey PRIMARY KEY (table_name, record_id)
-                            INCLUDE (op_type, version, updated_at)
-                    ) WITH (fillfactor = 70);
-                "#,
+            CREATE TABLE IF NOT EXISTS boomerang.sync_log
+            (
+                table_name text COLLATE "C" NOT NULL,
+                record_id  text COLLATE "C" NOT NULL,
+                op_type    char(1)          NOT NULL CHECK (op_type IN ('I', 'U', 'D')),
+                version    bigint           NOT NULL DEFAULT 1,
+                updated_at bigint           NOT NULL,
+                CONSTRAINT sync_log_pkey PRIMARY KEY (table_name, record_id)
+            ) WITH (fillfactor = 70);
+        "#,
         )
         .execute(&mut **tx)
         .await

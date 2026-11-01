@@ -22,6 +22,10 @@
 
 mod core;
 mod dialect;
+mod sync;
 
 pub use crate::core::{StringInterner, Symbol};
 pub use crate::dialect::PostgresDatabase;
+pub use crate::sync::{
+    LogOpType, RowAction, SyncLogEntry, SyncTruthEntry, TruthTable, TruthTableError,
+};

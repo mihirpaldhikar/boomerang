@@ -10,3 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 mimalloc.workspace = true
+tokio.workspace = true
+database.workspace = true
