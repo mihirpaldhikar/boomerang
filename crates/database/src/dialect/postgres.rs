@@ -30,15 +30,23 @@ const DATABASE_SCHEMA_QUERY: &'static str = include_str!("../../../../sql/databa
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum PostgresDatabaseError {
-    InitialChecksFailed,
-    SetupFailed { reason: String },
+    FailedToAcquireTransaction,
+    FailedToCommitTransaction,
+    SetupFailed { step: &'static str, reason: String },
 }
 
 impl fmt::Display for PostgresDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            PostgresDatabaseError::InitialChecksFailed => write!(f, "Initial checks failed"),
-            PostgresDatabaseError::SetupFailed { reason } => write!(f, "Setup failed: {}", reason),
+            PostgresDatabaseError::FailedToAcquireTransaction => {
+                write!(f, "Failed to acquire transaction")
+            }
+            PostgresDatabaseError::FailedToCommitTransaction => {
+                write!(f, "Failed to commit transaction")
+            }
+            PostgresDatabaseError::SetupFailed { step, reason } => {
+                write!(f, "Setup failed while {step}: {reason}")
+            }
         }
     }
 }
@@ -63,11 +71,7 @@ impl PostgresDatabase {
     pub async fn new(connection_url: &str) -> Result<Self, PostgresDatabaseError> {
         let pool = PgPoolOptions::new().connect(connection_url).await.unwrap();
 
-        let setup_exists = Self::perform_checks(pool.clone()).await?;
-
-        if !setup_exists {
-            Self::perform_setup(pool.clone()).await?;
-        }
+        Self::perform_setup(pool.clone()).await?;
 
         let schema = Self::load_schema(pool.clone()).await.unwrap();
 
@@ -83,10 +87,13 @@ impl PostgresDatabase {
 }
 
 impl PostgresDatabase {
-    async fn perform_checks(
-        pool: sqlx::Pool<sqlx::Postgres>,
-    ) -> Result<bool, PostgresDatabaseError> {
-        match sqlx::query_scalar(
+    async fn perform_setup(pool: sqlx::Pool<sqlx::Postgres>) -> Result<(), PostgresDatabaseError> {
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| PostgresDatabaseError::FailedToAcquireTransaction)?;
+
+        match sqlx::query_scalar::<_, bool>(
             r#"
             SELECT count(p.proname) = 1
             FROM pg_catalog.pg_namespace n
@@ -98,28 +105,62 @@ impl PostgresDatabase {
               AND p.proname = 'database_schema';
         "#,
         )
-        .fetch_one(&pool)
+        .fetch_one(&mut *tx)
         .await
         {
-            Ok(result) => Ok(result),
-            Err(_) => Err(PostgresDatabaseError::InitialChecksFailed),
+            Ok(has_database_schema) => {
+                if !has_database_schema
+                    && let Err(err) = sqlx::raw_sql(DATABASE_SCHEMA_QUERY).execute(&mut *tx).await
+                {
+                    return Err(PostgresDatabaseError::SetupFailed {
+                        step: "creating database schema functions",
+                        reason: err.to_string(),
+                    });
+                }
+            }
+            Err(err) => {
+                return Err(PostgresDatabaseError::SetupFailed {
+                    step: "checking for database schema functions",
+                    reason: err.to_string(),
+                });
+            }
         }
-    }
 
-    async fn perform_setup(pool: sqlx::Pool<sqlx::Postgres>) -> Result<(), PostgresDatabaseError> {
-        if let Err(r) = sqlx::raw_sql(DATABASE_SCHEMA_QUERY).execute(&pool).await {
+        if let Err(r) = sqlx::raw_sql(
+            r#"
+                    CREATE TABLE IF NOT EXISTS boomerang.sync_log
+                    (
+                        table_name text    NOT NULL,
+                        record_id  text    NOT NULL,
+                        op_type    char(1) NOT NULL CHECK (op_type IN ('I', 'U', 'D')),
+                        version    bigint  NOT NULL DEFAULT 1,
+                        updated_at bigint  NOT NULL,
+                        CONSTRAINT sync_log_pkey PRIMARY KEY (table_name, record_id)
+                            INCLUDE (op_type, version, updated_at)
+                    ) WITH (fillfactor = 70);
+                "#,
+        )
+        .execute(&mut *tx)
+        .await
+        {
             return Err(PostgresDatabaseError::SetupFailed {
+                step: "creating sync log table",
                 reason: r.to_string(),
             });
         }
+
+        tx.commit()
+            .await
+            .map_err(|_| PostgresDatabaseError::FailedToCommitTransaction)?;
 
         Ok(())
     }
 
     async fn load_schema(pool: sqlx::Pool<sqlx::Postgres>) -> Result<DatabaseSchema, sqlx::Error> {
-        let mut rows =
-            sqlx::query("SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;")
-                .fetch(&pool);
+        let mut rows = sqlx::query(
+            "SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;",
+        )
+        .fetch(&pool);
 
         let mut builder = DatabaseSchemaBuilder::with_capacity(200, 2000);
 
