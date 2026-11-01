@@ -19,13 +19,44 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-mod string_interner;
-mod value;
 mod schema;
 mod schema_builder;
-mod ident;
+mod string_interner;
+mod value;
 
-pub use string_interner::{StringInterner, Symbol};
-pub use schema::{DatabaseSchema, Action};
+pub use schema::{Action, DatabaseSchema};
 pub use schema_builder::{DatabaseSchemaBuilder, RawForeignKey};
-pub(crate) use ident::Ident;
+use std::fmt;
+use std::fmt::{Display, Write};
+pub use string_interner::{StringInterner, Symbol};
+
+/// Quoted SQL identifier. Escapes on the fly, no intermediate String.
+pub(crate) struct Ident<'a>(pub &'a str);
+
+impl Display for Ident<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char('"')?;
+        for c in self.0.chars() {
+            if c == '"' {
+                f.write_char('"')?;
+            }
+            f.write_char(c)?;
+        }
+        f.write_char('"')
+    }
+}
+
+pub(crate) struct Lit<'a>(pub &'a str);
+
+impl Display for Lit<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_char('\'')?;
+        self.0.chars().try_for_each(|c| {
+            if c == '\'' {
+                f.write_char('\'')?;
+            }
+            f.write_char(c)
+        })?;
+        f.write_char('\'')
+    }
+}

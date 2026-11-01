@@ -19,7 +19,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, RawForeignKey};
+use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, Lit, RawForeignKey};
 use futures::TryStreamExt;
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgPoolOptions;
@@ -106,6 +106,8 @@ impl PostgresDatabase {
             .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
 
         Self::backfill_sync_logs(&schema, &mut tx).await?;
+
+        Self::setup_triggers(&schema, &mut tx).await?;
 
         tx.commit()
             .await
@@ -314,6 +316,66 @@ impl PostgresDatabase {
                 table = Ident(table_name),
             )))
                 .bind(format!("public.{table_name}"))
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+        }
+
+        Ok(())
+    }
+
+    async fn setup_triggers(
+        schema: &DatabaseSchema,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), PostgresDatabaseError> {
+        for table in schema.tables() {
+            let table_name = table.name();
+
+            let primary_col = match table.primary_key() {
+                Some(col) => col.name(),
+                None => {
+                    return Err(PostgresDatabaseError::SetupFailed {
+                        step: "creating table trigger",
+                        reason: format!("Table {} has no primary key", table_name),
+                    });
+                }
+            };
+
+            sqlx::raw_sql(AssertSqlSafe(format!(
+                r#"
+                    CREATE OR REPLACE FUNCTION {func}() RETURNS trigger
+                    LANGUAGE plpgsql AS $$
+                    BEGIN
+                        IF current_setting('boomerang.sync_write', true) = 'true' THEN
+                            RETURN NULL;
+                        END IF;
+
+                        INSERT INTO boomerang.sync_log AS l (table_name, record_id, op_type, version, updated_at)
+                        VALUES (
+                            {name},
+                            (CASE WHEN TG_OP = 'DELETE' THEN OLD.{pk} ELSE NEW.{pk} END)::text,
+                            left(TG_OP, 1),
+                            1,
+                            (extract(epoch FROM clock_timestamp()) * 1000)::bigint
+                        )
+                        ON CONFLICT (table_name, record_id) DO UPDATE
+                        SET op_type    = EXCLUDED.op_type,
+                            version    = l.version + 1,
+                            updated_at = EXCLUDED.updated_at;
+
+                        RETURN NULL;
+                    END $$;
+
+                    CREATE OR REPLACE TRIGGER {trg}
+                    AFTER INSERT OR UPDATE OR DELETE ON {table}
+                    FOR EACH ROW EXECUTE FUNCTION {func}();
+                 "#,
+                func = Ident(&format!("sync_log_touch_{table_name}")),
+                trg = Ident(&format!("trg_{table_name}_sync_log")),
+                name = Lit(&format!("public.{table_name}")),
+                table = Ident(table_name),
+                pk = Ident(primary_col),
+            )))
                 .execute(&mut **tx)
                 .await
                 .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
