@@ -28,24 +28,32 @@ use std::sync::Arc;
 
 const DATABASE_SCHEMA_QUERY: &'static str = include_str!("../../../../sql/database_schema.sql");
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug)]
 pub enum PostgresDatabaseError {
     FailedToAcquireTransaction,
     FailedToCommitTransaction,
     SetupFailed { step: &'static str, reason: String },
+    SchemaHashComputationFailed,
+    SqlxError(sqlx::Error),
 }
 
 impl fmt::Display for PostgresDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             PostgresDatabaseError::FailedToAcquireTransaction => {
-                write!(f, "Failed to acquire transaction")
+                write!(f, "failed to acquire transaction")
             }
             PostgresDatabaseError::FailedToCommitTransaction => {
-                write!(f, "Failed to commit transaction")
+                write!(f, "failed to commit transaction")
             }
             PostgresDatabaseError::SetupFailed { step, reason } => {
-                write!(f, "Setup failed while {step}: {reason}")
+                write!(f, "setup failed while {step}: {reason}")
+            }
+            PostgresDatabaseError::SchemaHashComputationFailed => {
+                write!(f, "failed to compute schema hash")
+            }
+            PostgresDatabaseError::SqlxError(err) => {
+                write!(f, "sqlx error: {}", err)
             }
         }
     }
@@ -156,7 +164,9 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    async fn load_schema(pool: sqlx::Pool<sqlx::Postgres>) -> Result<DatabaseSchema, sqlx::Error> {
+    async fn load_schema(
+        pool: sqlx::Pool<sqlx::Postgres>,
+    ) -> Result<DatabaseSchema, PostgresDatabaseError> {
         let mut rows = sqlx::query(
             "SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;",
         )
@@ -164,11 +174,19 @@ impl PostgresDatabase {
 
         let mut builder = DatabaseSchemaBuilder::with_capacity(200, 2000);
 
-        while let Some(row) = rows.try_next().await? {
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|err| PostgresDatabaseError::SqlxError(err))?
+        {
             use sqlx::Row;
 
-            let table_name: &str = row.try_get("table_name")?;
-            let column_name: &str = row.try_get("column_name")?;
+            let table_name: &str = row
+                .try_get("table_name")
+                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+            let column_name: &str = row
+                .try_get("column_name")
+                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
 
             let fk_constraints: Vec<String> = row.try_get("fk_constraints").unwrap_or_default();
             let fk_namespaces: Vec<String> = row.try_get("fk_namespaces").unwrap_or_default();
@@ -198,10 +216,14 @@ impl PostgresDatabase {
             builder.add_row(
                 table_name,
                 column_name,
-                row.try_get("data_type")?,
-                row.try_get("nullable")?,
-                row.try_get("is_primary")?,
-                row.try_get("is_unique")?,
+                row.try_get("data_type")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                row.try_get("nullable")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                row.try_get("is_primary")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                row.try_get("is_unique")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
                 row.try_get("default_expr").unwrap_or(None),
                 foreign_keys_iter,
                 check_defs.iter().map(String::as_str),
@@ -209,7 +231,23 @@ impl PostgresDatabase {
             );
         }
 
-        // TODO: Figure out how to handle schema hash.
-        Ok(builder.build([0u8; 32]))
+        let schema_hash: [u8; 32] = match sqlx::query_scalar(
+            r#"
+            SELECT sha256(convert_to(coalesce(string_agg(r.j, E'\n' ORDER BY r.table_name, r.ord), ''), 'UTF8'))
+            FROM (
+                SELECT s.table_name,
+                       row_number() OVER (PARTITION BY s.table_name ORDER BY s.attnum) AS ord,
+                       (to_jsonb(s) - 'attnum')::text AS j
+                FROM boomerang.database_schema('public') s
+            ) r"#,
+        )
+        .fetch_one(&pool)
+        .await
+        {
+            Ok(hash) => hash,
+            Err(_) => return Err(PostgresDatabaseError::SchemaHashComputationFailed),
+        };
+
+        Ok(builder.build(schema_hash))
     }
 }
