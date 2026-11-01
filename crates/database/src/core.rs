@@ -23,7 +23,9 @@ mod string_interner;
 mod value;
 mod schema;
 mod schema_builder;
+mod ident;
 
 pub use string_interner::{StringInterner, Symbol};
 pub use schema::{DatabaseSchema, Action};
 pub use schema_builder::{DatabaseSchemaBuilder, RawForeignKey};
+pub(crate) use ident::Ident;

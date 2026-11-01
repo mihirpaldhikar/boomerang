@@ -19,8 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, RawForeignKey};
+use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, RawForeignKey};
 use futures::TryStreamExt;
+use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgPoolOptions;
 use std::fmt;
 use std::fmt::Formatter;
@@ -30,16 +31,21 @@ const DATABASE_SCHEMA_QUERY: &'static str = include_str!("../../../../sql/databa
 
 #[derive(Debug)]
 pub enum PostgresDatabaseError {
+    ConnectionPoolFailed,
     FailedToAcquireTransaction,
     FailedToCommitTransaction,
     SetupFailed { step: &'static str, reason: String },
     SchemaHashComputationFailed,
     SqlxError(sqlx::Error),
+    BackfillFailed { table: String, reason: &'static str },
 }
 
 impl fmt::Display for PostgresDatabaseError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            PostgresDatabaseError::ConnectionPoolFailed => {
+                write!(f, "failed to create connection pool")
+            }
             PostgresDatabaseError::FailedToAcquireTransaction => {
                 write!(f, "failed to acquire transaction")
             }
@@ -54,6 +60,9 @@ impl fmt::Display for PostgresDatabaseError {
             }
             PostgresDatabaseError::SqlxError(err) => {
                 write!(f, "sqlx error: {}", err)
+            }
+            PostgresDatabaseError::BackfillFailed { table, reason } => {
+                write!(f, "backfill failed for table {table}: {reason}")
             }
         }
     }
@@ -77,11 +86,30 @@ impl Clone for PostgresDatabase {
 
 impl PostgresDatabase {
     pub async fn new(connection_url: &str) -> Result<Self, PostgresDatabaseError> {
-        let pool = PgPoolOptions::new().connect(connection_url).await.unwrap();
+        let pool = PgPoolOptions::new()
+            .connect(connection_url)
+            .await
+            .map_err(|_| PostgresDatabaseError::ConnectionPoolFailed)?;
 
-        Self::perform_setup(pool.clone()).await?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|_| PostgresDatabaseError::FailedToAcquireTransaction)?;
 
-        let schema = Self::load_schema(pool.clone()).await.unwrap();
+        Self::perform_setup(&mut tx).await?;
+
+        let schema = Self::load_schema(&mut tx).await?;
+
+        sqlx::query("SET LOCAL boomerang.sync_write = 'true'")
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+
+        Self::backfill_sync_logs(&schema, &mut tx).await?;
+
+        tx.commit()
+            .await
+            .map_err(|_| PostgresDatabaseError::FailedToCommitTransaction)?;
 
         Ok(Self {
             pool,
@@ -95,12 +123,9 @@ impl PostgresDatabase {
 }
 
 impl PostgresDatabase {
-    async fn perform_setup(pool: sqlx::Pool<sqlx::Postgres>) -> Result<(), PostgresDatabaseError> {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|_| PostgresDatabaseError::FailedToAcquireTransaction)?;
-
+    async fn perform_setup(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), PostgresDatabaseError> {
         match sqlx::query_scalar::<_, bool>(
             r#"
             SELECT count(p.proname) = 1
@@ -113,12 +138,14 @@ impl PostgresDatabase {
               AND p.proname = 'database_schema';
         "#,
         )
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         {
             Ok(has_database_schema) => {
                 if !has_database_schema
-                    && let Err(err) = sqlx::raw_sql(DATABASE_SCHEMA_QUERY).execute(&mut *tx).await
+                    && let Err(err) = sqlx::raw_sql(DATABASE_SCHEMA_QUERY)
+                        .execute(&mut **tx)
+                        .await
                 {
                     return Err(PostgresDatabaseError::SetupFailed {
                         step: "creating database schema functions",
@@ -148,7 +175,7 @@ impl PostgresDatabase {
                     ) WITH (fillfactor = 70);
                 "#,
         )
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         {
             return Err(PostgresDatabaseError::SetupFailed {
@@ -157,78 +184,76 @@ impl PostgresDatabase {
             });
         }
 
-        tx.commit()
-            .await
-            .map_err(|_| PostgresDatabaseError::FailedToCommitTransaction)?;
-
         Ok(())
     }
 
     async fn load_schema(
-        pool: sqlx::Pool<sqlx::Postgres>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<DatabaseSchema, PostgresDatabaseError> {
-        let mut rows = sqlx::query(
-            "SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;",
-        )
-        .fetch(&pool);
-
         let mut builder = DatabaseSchemaBuilder::with_capacity(200, 2000);
 
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .map_err(|err| PostgresDatabaseError::SqlxError(err))?
         {
-            use sqlx::Row;
+            let mut rows = sqlx::query(
+                "SELECT * FROM boomerang.database_schema('public') ORDER BY table_name, attnum;",
+            )
+            .fetch(&mut **tx);
 
-            let table_name: &str = row
-                .try_get("table_name")
-                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
-            let column_name: &str = row
-                .try_get("column_name")
-                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+            while let Some(row) = rows
+                .try_next()
+                .await
+                .map_err(|err| PostgresDatabaseError::SqlxError(err))?
+            {
+                use sqlx::Row;
 
-            let fk_constraints: Vec<String> = row.try_get("fk_constraints").unwrap_or_default();
-            let fk_namespaces: Vec<String> = row.try_get("fk_namespaces").unwrap_or_default();
-            let fk_tables: Vec<String> = row.try_get("fk_tables").unwrap_or_default();
-            let fk_columns: Vec<String> = row.try_get("fk_columns").unwrap_or_default();
-            let fk_on_update: Vec<i16> = row.try_get("fk_on_update").unwrap_or_default();
-            let fk_on_delete: Vec<i16> = row.try_get("fk_on_delete").unwrap_or_default();
-            let check_defs: Vec<String> = row.try_get("check_defs").unwrap_or_default();
-            let domain_checks: Vec<String> = row.try_get("domain_checks").unwrap_or_default();
+                let table_name: &str = row
+                    .try_get("table_name")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+                let column_name: &str = row
+                    .try_get("column_name")
+                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
 
-            let foreign_keys_iter = fk_constraints
-                .iter()
-                .zip(&fk_namespaces)
-                .zip(&fk_tables)
-                .zip(&fk_columns)
-                .zip(&fk_on_update)
-                .zip(&fk_on_delete)
-                .map(|(((((c, n), t), col), upd), del)| RawForeignKey {
-                    constraint_name: c,
-                    namespace: n,
-                    referenced_table: t,
-                    referenced_column: col,
-                    on_update: Action::from(*upd),
-                    on_delete: Action::from(*del),
-                });
+                let fk_constraints: Vec<String> = row.try_get("fk_constraints").unwrap_or_default();
+                let fk_namespaces: Vec<String> = row.try_get("fk_namespaces").unwrap_or_default();
+                let fk_tables: Vec<String> = row.try_get("fk_tables").unwrap_or_default();
+                let fk_columns: Vec<String> = row.try_get("fk_columns").unwrap_or_default();
+                let fk_on_update: Vec<i16> = row.try_get("fk_on_update").unwrap_or_default();
+                let fk_on_delete: Vec<i16> = row.try_get("fk_on_delete").unwrap_or_default();
+                let check_defs: Vec<String> = row.try_get("check_defs").unwrap_or_default();
+                let domain_checks: Vec<String> = row.try_get("domain_checks").unwrap_or_default();
 
-            builder.add_row(
-                table_name,
-                column_name,
-                row.try_get("data_type")
-                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
-                row.try_get("nullable")
-                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
-                row.try_get("is_primary")
-                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
-                row.try_get("is_unique")
-                    .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
-                row.try_get("default_expr").unwrap_or(None),
-                foreign_keys_iter,
-                check_defs.iter().map(String::as_str),
-                domain_checks.iter().map(String::as_str),
-            );
+                let foreign_keys_iter = fk_constraints
+                    .iter()
+                    .zip(&fk_namespaces)
+                    .zip(&fk_tables)
+                    .zip(&fk_columns)
+                    .zip(&fk_on_update)
+                    .zip(&fk_on_delete)
+                    .map(|(((((c, n), t), col), upd), del)| RawForeignKey {
+                        constraint_name: c,
+                        namespace: n,
+                        referenced_table: t,
+                        referenced_column: col,
+                        on_update: Action::from(*upd),
+                        on_delete: Action::from(*del),
+                    });
+
+                builder.add_row(
+                    table_name,
+                    column_name,
+                    row.try_get("data_type")
+                        .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                    row.try_get("nullable")
+                        .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                    row.try_get("is_primary")
+                        .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                    row.try_get("is_unique")
+                        .map_err(|err| PostgresDatabaseError::SqlxError(err))?,
+                    row.try_get("default_expr").unwrap_or(None),
+                    foreign_keys_iter,
+                    check_defs.iter().map(String::as_str),
+                    domain_checks.iter().map(String::as_str),
+                );
+            }
         }
 
         let schema_hash: [u8; 32] = match sqlx::query_scalar(
@@ -241,13 +266,59 @@ impl PostgresDatabase {
                 FROM boomerang.database_schema('public') s
             ) r"#,
         )
-        .fetch_one(&pool)
-        .await
+            .fetch_one(&mut **tx)
+            .await
         {
             Ok(hash) => hash,
             Err(_) => return Err(PostgresDatabaseError::SchemaHashComputationFailed),
         };
 
         Ok(builder.build(schema_hash))
+    }
+
+    async fn backfill_sync_logs(
+        schema: &DatabaseSchema,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<(), PostgresDatabaseError> {
+        let log_row_count: i64 = sqlx::query_scalar("SELECT count(*) FROM boomerang.sync_log")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+
+        if log_row_count > 0 {
+            return Ok(());
+        }
+
+        for table in schema.tables() {
+            let table_name = table.name();
+
+            let primary_col = match table.primary_key() {
+                Some(col) => col.name(),
+                None => {
+                    return Err(PostgresDatabaseError::BackfillFailed {
+                        table: table_name.to_string(),
+                        reason: "Table has no primary key",
+                    });
+                }
+            };
+
+            sqlx::query(AssertSqlSafe(format!(
+                r#"
+                    INSERT INTO boomerang.sync_log (table_name, record_id, op_type, version, updated_at)
+                    SELECT $1, {pk}::text, 'I', 1, (extract(epoch from now()) * 1000)::bigint
+                    FROM {schema}.{table}
+                    ON CONFLICT (table_name, record_id) DO NOTHING
+                "#,
+                pk = Ident(primary_col),
+                schema = Ident("public"),
+                table = Ident(table_name),
+            )))
+                .bind(format!("public.{table_name}"))
+                .execute(&mut **tx)
+                .await
+                .map_err(|err| PostgresDatabaseError::SqlxError(err))?;
+        }
+
+        Ok(())
     }
 }
