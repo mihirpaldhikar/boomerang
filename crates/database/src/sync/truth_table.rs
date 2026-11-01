@@ -25,30 +25,17 @@
 //! For each key, the entries from the two sides are compared and the winning side is reported
 //! as a [`RowAction`].
 
+use crate::Symbol;
+use crate::core::DatabaseSchema;
+use crate::sync::log_row::{LogRow, PG_SQL, SQLITE_SQL};
 use futures::StreamExt;
 use futures::stream::BoxStream;
+use sqlx::postgres::PgRow;
+use sqlx::sqlite::SqliteRow;
 use sqlx::{PgPool, SqlitePool};
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Postgres log query.
-///
-/// The merge requires byte-wise ordering identical to Rust's `str::cmp`. The explicit
-/// `COLLATE "C"` overrides the database and column collation, which could otherwise order
-/// keys differently from the SQLite side. `op_type` is cast to `text` because the column is
-/// `char(1)`, which does not decode into `String` directly.
-const PG_SQL: &str = r#"
-    SELECT table_name, record_id, op_type::text AS op_type, version, updated_at
-    FROM boomerang.sync_log
-    ORDER BY table_name COLLATE "C", record_id COLLATE "C"
-"#;
-
-/// SQLite log query, ordered byte-wise to match [`PG_SQL`] and Rust's `str::cmp`.
-const SQLITE_SQL: &str = r#"
-    SELECT table_name, record_id, op_type, version, updated_at
-    FROM __sync_log__
-    ORDER BY table_name COLLATE BINARY, record_id COLLATE BINARY
-"#;
 
 /// Kind of change recorded in a log entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,11 +43,6 @@ pub enum LogOpType {
     Insert,
     Update,
     Delete,
-}
-
-impl TryFrom<String> for LogOpType {
-    type Error = InvalidOpType;
-    fn try_from(s: String) -> Result<Self, Self::Error> { Self::try_from(s.as_str()) }
 }
 
 /// Error returned when a stored op type is not one of `I`, `U` or `D`.
@@ -89,35 +71,93 @@ impl TryFrom<&str> for LogOpType {
     }
 }
 
+/// Lookahead for one stream: the undecoded row plus its cheap, allocation-free fields.
+/// `record_id` stays borrowed from the row until the entry is known to be needed.
+struct Head<R> {
+    row: R,
+    table: Symbol,
+    op: LogOpType,
+    version: i64,
+    updated_at: i64,
+}
+
+impl<R: LogRow> Head<R> {
+    fn new(
+        row: R,
+        schema: &DatabaseSchema,
+        cache: &mut TableCache,
+        db_err: fn(sqlx::Error) -> TruthTableError,
+    ) -> Result<Self, TruthTableError> {
+        let table = cache.symbol_for(schema, row.table().map_err(db_err)?)?;
+        let op = LogOpType::try_from(row.op().map_err(db_err)?).map_err(|e| {
+            db_err(sqlx::Error::ColumnDecode {
+                index: "op_type".to_string(),
+                source: Box::new(e),
+            })
+        })?;
+        let version = row.version().map_err(db_err)?;
+        let updated_at = row.updated_at().map_err(db_err)?;
+        row.record_id().map_err(db_err)?;
+
+        Ok(Self {
+            row,
+            table,
+            op,
+            version,
+            updated_at,
+        })
+    }
+
+    #[inline]
+    fn record_id(&self) -> &str {
+        self.row.record_id().expect("validated in Head::new")
+    }
+
+    /// The only place `record_id` is copied to the heap.
+    fn into_entry(self) -> SyncLogEntry {
+        SyncLogEntry {
+            table_name: self.table,
+            record_id: self.record_id().to_owned(),
+            op_type: self.op,
+            version: self.version,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Merge-key comparison across any two heads. Equal symbols skip the string resolve.
+#[inline]
+fn cmp_heads<A: LogRow, B: LogRow>(a: &Head<A>, b: &Head<B>, schema: &DatabaseSchema) -> Ordering {
+    if a.table == b.table {
+        a.record_id().cmp(b.record_id())
+    } else {
+        let name = |s| {
+            schema
+                .resolve_symbol(s)
+                .expect("symbol not from this schema")
+        };
+        name(a.table).cmp(name(b.table))
+    }
+}
+
 /// A single row of a sync log.
 ///
 /// `(table_name, record_id)` uniquely identifies a record. `version` is incremented on every
 /// change to that record, and `updated_at` is the change time in milliseconds since the Unix
 /// epoch.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct SyncLogEntry {
-    pub table_name: String,
+    pub table_name: Symbol,
     pub record_id: String,
-    /// Raw operation code (`I`, `U` or `D`).
-    #[sqlx(try_from = "String")]
+    /// The operation this entry records.
     pub op_type: LogOpType,
     pub version: i64,
     pub updated_at: i64,
 }
 
-impl SyncLogEntry {
-    /// Merge key. Both streams are ordered by this key.
-    #[inline]
-    fn key(&self) -> (&str, &str) {
-        (&self.table_name, &self.record_id)
-    }
-}
-
 /// Outcome of comparing the two sides for one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowAction {
-    /// Both sides agree; nothing to apply.
-    None,
     /// The Postgres entry wins; apply it to SQLite.
     ApplyFromPostgres,
     /// The SQLite entry wins; apply it to Postgres.
@@ -125,6 +165,46 @@ pub enum RowAction {
     /// `version` and `updated_at` are equal but the operations differ.
     /// This needs an explicit resolution policy.
     Conflict,
+}
+
+/// Per-stream memo of the last table name seen and its schema [`Symbol`].
+///
+/// Both logs are ordered by table name, so consecutive rows almost always belong to the same
+/// table. A hit costs a single `&str` comparison — no allocation and no interner hash. The
+/// owned buffer is rewritten (reusing its capacity) only when the stream crosses into the
+/// next table, i.e. once per table per stream.
+#[derive(Default)]
+struct TableCache {
+    name: String,
+    symbol: Option<Symbol>,
+}
+
+impl TableCache {
+    /// Returns the schema symbol for `table`, hitting the memo when possible.
+    ///
+    /// A lookup miss in the schema means the log references a table unknown to the schema,
+    /// which the guarantee forbids — reported as [`TruthTableError::UnknownTable`].
+    #[inline]
+    fn symbol_for(
+        &mut self,
+        schema: &DatabaseSchema,
+        table: &str,
+    ) -> Result<Symbol, TruthTableError> {
+        if let Some(symbol) = self.symbol
+            && self.name == table
+        {
+            return Ok(symbol);
+        }
+
+        let symbol = schema
+            .get_symbol(table)
+            .ok_or_else(|| TruthTableError::UnknownTable(table.to_string()))?;
+
+        self.name.clear();
+        self.name.push_str(table);
+        self.symbol = Some(symbol);
+        Ok(symbol)
+    }
 }
 
 /// The entries found for one record on each side, and the resulting action.
@@ -138,11 +218,11 @@ pub struct SyncTruthEntry {
 }
 
 impl SyncTruthEntry {
-    /// Returns the entry that should be applied, or `None` when there is nothing to apply
-    /// (`None`) or the outcome is undecided (`Conflict`).
+    /// Returns the entry that should be applied, or `None` when the outcome is undecided
+    /// ([`RowAction::Conflict`]).
     pub fn winning_entry(&self) -> Option<&SyncLogEntry> {
         match self.action {
-            RowAction::None | RowAction::Conflict => None,
+            RowAction::Conflict => None,
             RowAction::ApplyFromPostgres => self.postgres.as_ref(),
             RowAction::ApplyFromSQLite => self.sqlite.as_ref(),
         }
@@ -154,6 +234,9 @@ impl SyncTruthEntry {
 pub enum TruthTableError {
     Postgres(sqlx::Error),
     Sqlite(sqlx::Error),
+    /// A log row referenced a table that is not interned in the schema. The schema and the
+    /// sync log are out of sync; the merge cannot continue.
+    UnknownTable(String),
 }
 
 impl fmt::Display for TruthTableError {
@@ -161,6 +244,7 @@ impl fmt::Display for TruthTableError {
         match self {
             Self::Postgres(e) => write!(f, "postgres stream error: {e}"),
             Self::Sqlite(e) => write!(f, "sqlite stream error: {e}"),
+            Self::UnknownTable(t) => write!(f, "sync log references unknown table: {t}"),
         }
     }
 }
@@ -169,6 +253,7 @@ impl std::error::Error for TruthTableError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Postgres(e) | Self::Sqlite(e) => Some(e),
+            Self::UnknownTable(_) => None,
         }
     }
 }
@@ -187,19 +272,29 @@ impl std::error::Error for TruthTableError {
 /// Each stream holds one pooled connection until it is exhausted or dropped. Avoid running
 /// other queries on a single-connection pool while iterating.
 pub struct TruthTable<'a> {
-    pg_stream: BoxStream<'a, Result<SyncLogEntry, sqlx::Error>>,
-    sq_stream: BoxStream<'a, Result<SyncLogEntry, sqlx::Error>>,
-    /// Lookahead: the next unconsumed entry of each stream.
-    pg_current: Option<SyncLogEntry>,
-    sq_current: Option<SyncLogEntry>,
+    schema: &'a DatabaseSchema,
+    pg_stream: BoxStream<'a, Result<PgRow, sqlx::Error>>,
+    sq_stream: BoxStream<'a, Result<SqliteRow, sqlx::Error>>,
+    /// Last-table memo of each stream; see [`TableCache`].
+    pg_cache: TableCache,
+    sq_cache: TableCache,
+    /// Lookahead: the next unconsumed row of each stream.
+    pg_head: Option<Head<PgRow>>,
+    sq_head: Option<Head<SqliteRow>>,
 }
 
 /// Reads the next entry from a stream, flattening `Option<Result<_>>` into `Result<Option<_>>`.
 #[inline]
-async fn pull(
-    s: &mut BoxStream<'_, Result<SyncLogEntry, sqlx::Error>>,
-) -> Result<Option<SyncLogEntry>, sqlx::Error> {
-    s.next().await.transpose()
+async fn pull<R: LogRow>(
+    s: &mut BoxStream<'_, Result<R, sqlx::Error>>,
+    schema: &DatabaseSchema,
+    cache: &mut TableCache,
+    db_err: fn(sqlx::Error) -> TruthTableError,
+) -> Result<Option<Head<R>>, TruthTableError> {
+    match s.next().await.transpose().map_err(db_err)? {
+        Some(row) => Head::new(row, schema, cache, db_err).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Installs `next` as the lookahead entry and returns the previous one.
@@ -207,13 +302,17 @@ async fn pull(
 /// In debug builds, asserts that the stream is strictly ascending by key. A violation means
 /// the ordering contract is broken and the merge results would be wrong.
 #[inline]
-fn advance(cur: &mut Option<SyncLogEntry>, next: Option<SyncLogEntry>) -> Option<SyncLogEntry> {
+fn advance<R: LogRow>(
+    cur: &mut Option<Head<R>>,
+    next: Option<Head<R>>,
+    schema: &DatabaseSchema,
+) -> Option<Head<R>> {
     if let (Some(old), Some(new)) = (cur.as_ref(), next.as_ref()) {
         debug_assert!(
-            new.key() > old.key(),
+            cmp_heads(new, old, schema) == Ordering::Greater,
             "stream not strictly ascending: {:?} -> {:?}",
-            old.key(),
-            new.key()
+            old.record_id(),
+            new.record_id()
         );
     }
     std::mem::replace(cur, next)
@@ -221,64 +320,103 @@ fn advance(cur: &mut Option<SyncLogEntry>, next: Option<SyncLogEntry>) -> Option
 
 impl<'a> TruthTable<'a> {
     /// Opens both log streams and primes the lookahead with the first entry of each.
-    pub async fn new(pg: &'a PgPool, sqlite: &'a SqlitePool) -> Result<Self, TruthTableError> {
-        let mut pg_stream = sqlx::query_as::<_, SyncLogEntry>(PG_SQL).fetch(pg);
-        let mut sq_stream = sqlx::query_as::<_, SyncLogEntry>(SQLITE_SQL).fetch(sqlite);
+    pub async fn new(
+        pg: &'a PgPool,
+        sqlite: &'a SqlitePool,
+        schema: &'a DatabaseSchema,
+    ) -> Result<Self, TruthTableError> {
+        let mut pg_stream = sqlx::query(PG_SQL).fetch(pg);
+        let mut sq_stream = sqlx::query(SQLITE_SQL).fetch(sqlite);
+        let mut pg_cache = TableCache::default();
+        let mut sq_cache = TableCache::default();
 
-        let pg_current = pull(&mut pg_stream)
-            .await
-            .map_err(TruthTableError::Postgres)?;
-        let sq_current = pull(&mut sq_stream)
-            .await
-            .map_err(TruthTableError::Sqlite)?;
+        // Prime both lookaheads concurrently.
+        let (pg_head, sq_head) = futures::try_join!(
+            pull(
+                &mut pg_stream,
+                schema,
+                &mut pg_cache,
+                TruthTableError::Postgres
+            ),
+            pull(
+                &mut sq_stream,
+                schema,
+                &mut sq_cache,
+                TruthTableError::Sqlite
+            ),
+        )?;
 
         Ok(Self {
+            schema,
             pg_stream,
             sq_stream,
-            pg_current,
-            sq_current,
+            pg_cache,
+            sq_cache,
+            pg_head,
+            sq_head,
         })
     }
 
-    /// Returns the next record in key order, or `None` when both logs are exhausted.
+    /// Returns the next *divergent* record in key order, or `None` when both logs are
+    /// exhausted. Records on which both sides already agree are skipped internally without
+    /// allocating.
     ///
     /// The side with the smaller key is consumed. If the keys are equal, both sides are
     /// consumed and compared.
+    /// # Cancellation
+    ///
+    /// `next_entry` is not cancellation-safe: dropping its future mid-poll can lose a fetched
+    /// row from one stream. Do not race it inside `select!`; poll it to completion.
     pub async fn next_entry(&mut self) -> Result<Option<SyncTruthEntry>, TruthTableError> {
-        // Decide which side(s) to consume. A side that is exhausted always loses the
-        // comparison, so the other side drains.
-        let ord = match (&self.pg_current, &self.sq_current) {
-            (None, None) => return Ok(None),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(p), Some(s)) => p.key().cmp(&s.key()),
-        };
+        let Self {
+            schema,
+            pg_stream,
+            sq_stream,
+            pg_cache,
+            sq_cache,
+            pg_head,
+            sq_head,
+        } = self;
+        let schema: &DatabaseSchema = schema;
 
-        // Fetch before swapping, so lookahead entries are consumed only if every fetch
-        // succeeded.
-        let next_pg = if ord != Ordering::Greater {
-            Some(
-                pull(&mut self.pg_stream)
-                    .await
-                    .map_err(TruthTableError::Postgres)?,
-            )
-        } else {
-            None
-        };
-        let next_sq = if ord != Ordering::Less {
-            Some(
-                pull(&mut self.sq_stream)
-                    .await
-                    .map_err(TruthTableError::Sqlite)?,
-            )
-        } else {
-            None
-        };
+        loop {
+            let ord = match (&*pg_head, &*sq_head) {
+                (None, None) => return Ok(None),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(p), Some(s)) => cmp_heads(p, s, schema),
+            };
 
-        let pg = next_pg.and_then(|n| advance(&mut self.pg_current, n));
-        let sq = next_sq.and_then(|n| advance(&mut self.sq_current, n));
+            // Both fetches are in flight together when the keys are equal.
+            let (next_pg, next_sq) = futures::try_join!(
+                async {
+                    if ord != Ordering::Greater {
+                        pull(pg_stream, schema, pg_cache, TruthTableError::Postgres)
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+                async {
+                    if ord != Ordering::Less {
+                        pull(sq_stream, schema, sq_cache, TruthTableError::Sqlite)
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+            )?;
 
-        Ok(Some(Self::resolve(pg, sq)))
+            let pg = next_pg.and_then(|n| advance(pg_head, n, schema));
+            let sq = next_sq.and_then(|n| advance(sq_head, n, schema));
+
+            if let Some(entry) = Self::resolve(pg, sq) {
+                return Ok(Some(entry));
+            }
+            // Records that were already in sync are skipped without allocating.
+        }
     }
 
     /// Chooses the winning side for one record.
@@ -290,23 +428,23 @@ impl<'a> TruthTable<'a> {
     ///
     /// `version` is a per-side change counter, not a global clock, so this is a
     /// last-writer-wins policy based on change count first and time second.
-    fn resolve(pg: Option<SyncLogEntry>, sq: Option<SyncLogEntry>) -> SyncTruthEntry {
+    fn resolve(pg: Option<Head<PgRow>>, sq: Option<Head<SqliteRow>>) -> Option<SyncTruthEntry> {
         let action = match (&pg, &sq) {
             (Some(_), None) => RowAction::ApplyFromPostgres,
             (None, Some(_)) => RowAction::ApplyFromSQLite,
             (Some(p), Some(s)) => match (p.version, p.updated_at).cmp(&(s.version, s.updated_at)) {
                 Ordering::Greater => RowAction::ApplyFromPostgres,
                 Ordering::Less => RowAction::ApplyFromSQLite,
-                Ordering::Equal if p.op_type == s.op_type => RowAction::None,
+                Ordering::Equal if p.op == s.op => return None, // in sync: nothing allocated
                 Ordering::Equal => RowAction::Conflict,
             },
             (None, None) => unreachable!("next_entry returns early when both sides are exhausted"),
         };
 
-        SyncTruthEntry {
-            postgres: pg,
-            sqlite: sq,
+        Some(SyncTruthEntry {
+            postgres: pg.map(Head::into_entry),
+            sqlite: sq.map(Head::into_entry),
             action,
-        }
+        })
     }
 }

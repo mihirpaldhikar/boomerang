@@ -21,6 +21,7 @@
  */
 
 mod truth_table;
+mod log_row;
 
 pub use truth_table::{
     LogOpType, RowAction, SyncLogEntry, SyncTruthEntry, TruthTable, TruthTableError,

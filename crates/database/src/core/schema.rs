@@ -405,6 +405,17 @@ impl DatabaseSchema {
     pub fn resolve_symbol(&self, symbol: Symbol) -> Option<&str> {
         self.interner.resolve(symbol)
     }
+
+    /// Looks up the [`Symbol`] of a string that is already interned in this schema's
+    /// interner, without inserting anything.
+    ///
+    /// Returns `None` if the string was never interned (e.g. a table that does not exist
+    /// in the schema).
+    #[inline]
+    pub fn get_symbol(&self, value: &str) -> Option<Symbol> {
+        self.interner.get(value)
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.tables.len()
