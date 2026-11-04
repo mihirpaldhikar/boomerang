@@ -80,6 +80,51 @@ impl PostgresDatabase {
     pub fn schema(&self) -> &DatabaseSchema {
         &self.schema
     }
+
+    pub async fn remove_setup(&self) -> Result<(), DatabaseError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| DatabaseError::FailedToAcquireTransaction)?;
+
+        let functions: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT p.proname
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND p.prokind = 'f'
+              AND p.proname LIKE 'sync\_log\_touch\_%'
+            "#,
+        )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(DatabaseError::SqlxError)?;
+
+        let mut sql = String::with_capacity(64 + functions.len() * 56);
+        for function in &functions {
+            use std::fmt::Write;
+            let _ = writeln!(
+                sql,
+                "DROP FUNCTION IF EXISTS {}() CASCADE;",
+                Ident(function)
+            );
+        }
+        sql.push_str("DROP SCHEMA IF EXISTS boomerang CASCADE;");
+
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| DatabaseError::SetupFailed {
+                step: "removing postgres sync artifacts",
+                reason: err.to_string(),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|_| DatabaseError::FailedToCommitTransaction)
+    }
 }
 
 impl PostgresDatabase {
