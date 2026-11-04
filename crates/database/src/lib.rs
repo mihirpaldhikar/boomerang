@@ -25,7 +25,7 @@ mod dialect;
 mod sync;
 
 pub use crate::core::{StringInterner, Symbol};
-pub use crate::dialect::{DatabaseError,PostgresDatabase};
+pub use crate::dialect::{DatabaseError, PostgresDatabase, SqliteDatabase};
 pub use crate::sync::{
     LogOpType, RowAction, SyncLogEntry, SyncTruthEntry, TruthTable, TruthTableError,
 };

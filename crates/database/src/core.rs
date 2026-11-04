@@ -29,6 +29,8 @@ pub use schema_builder::{DatabaseSchemaBuilder, RawForeignKey};
 use std::fmt;
 use std::fmt::{Display, Write};
 pub use string_interner::{StringInterner, Symbol};
+pub(crate) use value::ValueType;
+pub(crate) use schema::{TableRef, ColumnRef};
 
 /// Quoted SQL identifier. Escapes on the fly, no intermediate String.
 pub(crate) struct Ident<'a>(pub &'a str);

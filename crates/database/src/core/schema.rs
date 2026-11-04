@@ -23,6 +23,7 @@ use crate::StringInterner;
 use crate::core::schema_builder::DatabaseSchemaBuilder;
 use crate::core::string_interner::Symbol;
 use crate::core::value::ValueType;
+use std::fmt::Display;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -43,6 +44,18 @@ impl From<u8> for Action {
             3 => Self::SetDefault,
             4 => Self::Restrict,
             _ => unreachable!(),
+        }
+    }
+}
+
+impl Display for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Action::NoAction => write!(f, "NO ACTION"),
+            Action::Cascade => write!(f, "CASCADE"),
+            Action::SetNull => write!(f, "SET NULL"),
+            Action::SetDefault => write!(f, "SET DEFAULT"),
+            Action::Restrict => write!(f, "RESTRICT"),
         }
     }
 }

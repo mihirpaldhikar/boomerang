@@ -20,10 +20,12 @@
  * SOFTWARE.
  */
 mod postgres;
+mod sqlite;
 
+pub use postgres::PostgresDatabase;
+pub use sqlite::SqliteDatabase;
 use std::fmt;
 use std::fmt::Formatter;
-pub use postgres::{PostgresDatabase};
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -34,6 +36,7 @@ pub enum DatabaseError {
     SchemaHashComputationFailed,
     SqlxError(sqlx::Error),
     BackfillFailed { table: String, reason: &'static str },
+    InvalidSqliteBytes,
 }
 
 impl fmt::Display for DatabaseError {
@@ -59,6 +62,9 @@ impl fmt::Display for DatabaseError {
             }
             DatabaseError::BackfillFailed { table, reason } => {
                 write!(f, "backfill failed for table {table}: {reason}")
+            }
+            DatabaseError::InvalidSqliteBytes => {
+                write!(f, "provided bytes are not a valid SQLite database")
             }
         }
     }
