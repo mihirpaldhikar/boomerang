@@ -1,5 +1,5 @@
 use crate::DatabaseError;
-use crate::core::{ColumnRef, DatabaseSchema, Ident, TableRef, ValueType};
+use crate::core::{ColumnRef, DatabaseSchema, Ident, Lit, TableRef, ValueType};
 use hashbrown::HashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, Pool, Sqlite};
@@ -65,8 +65,6 @@ impl<'a> SqliteDatabase<'a> {
             .await
             .map_err(|_| DatabaseError::ConnectionPoolFailed)?;
 
-        println!("Path: {:?}", database_file.path());
-
         let instance = Self {
             pool,
             schema: ref_schema,
@@ -115,10 +113,14 @@ impl<'a> SqliteDatabase<'a> {
             None => instance.create_tables().await?,
         }
 
+        instance.drop_triggers().await?;
+
         Ok(instance)
     }
 
     pub async fn bytes(mut self) -> Result<Vec<u8>, DatabaseError> {
+        self.setup_triggers().await?;
+
         let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
             .execute(&self.pool)
             .await;
@@ -531,5 +533,98 @@ impl<'a> SqliteDatabase<'a> {
         }
 
         sql.push_str(");\n");
+    }
+
+    async fn setup_triggers(&self) -> Result<(), DatabaseError> {
+        let schema = self.schema;
+        let mut sql = String::with_capacity(schema.len() * 3 * 320);
+
+        for table in schema.tables() {
+            let table_name = table.name();
+
+            let primary_col = match table.primary_key() {
+                Some(col) => col.name(),
+                None => {
+                    return Err(DatabaseError::SetupFailed {
+                        step: "creating sqlite triggers",
+                        reason: format!("Table {table_name} has no primary key"),
+                    });
+                }
+            };
+
+            for (event, op, row) in [
+                ("INSERT", 'I', "NEW"),
+                ("UPDATE", 'U', "NEW"),
+                ("DELETE", 'D', "OLD"),
+            ] {
+                let _ = write!(
+                    sql,
+                    "CREATE TRIGGER IF NOT EXISTS {trg} AFTER {event} ON {tbl} FOR EACH ROW \
+                     BEGIN \
+                     INSERT INTO __sync_log__ (table_name, record_id, op_type, version, updated_at) \
+                     VALUES ({name}, CAST({row}.{pk} AS TEXT), '{op}', 1, \
+                     CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) \
+                     ON CONFLICT (table_name, record_id) DO UPDATE SET \
+                     op_type = excluded.op_type, \
+                     version = version + 1, \
+                     updated_at = excluded.updated_at; \
+                     END;\n",
+                    trg = Ident(&format!("__trg_{table_name}_{event}_sync_log__")),
+                    tbl = Ident(table_name),
+                    name = Lit(&format!("public.{table_name}")),
+                    pk = Ident(primary_col),
+                );
+            }
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| DatabaseError::FailedToAcquireTransaction)?;
+
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| DatabaseError::SetupFailed {
+                step: "creating sqlite triggers",
+                reason: err.to_string(),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|_| DatabaseError::FailedToCommitTransaction)
+    }
+
+    async fn drop_triggers(&self) -> Result<(), DatabaseError> {
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'trigger' AND name GLOB '__trg_*_sync_log__'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| DatabaseError::SetupFailed {
+            step: "listing sqlite triggers",
+            reason: err.to_string(),
+        })?;
+
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let mut sql = String::with_capacity(names.len() * 48);
+        for name in &names {
+            let _ = writeln!(sql, "DROP TRIGGER IF EXISTS {};", Ident(name));
+        }
+
+        sqlx::raw_sql(AssertSqlSafe(sql))
+            .execute(&self.pool)
+            .await
+            .map_err(|err| DatabaseError::SetupFailed {
+                step: "dropping sqlite triggers",
+                reason: err.to_string(),
+            })?;
+
+        Ok(())
     }
 }
