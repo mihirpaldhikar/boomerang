@@ -21,4 +21,47 @@
  */
 mod postgres;
 
-pub use postgres::{PostgresDatabase, PostgresDatabaseError};
+use std::fmt;
+use std::fmt::Formatter;
+pub use postgres::{PostgresDatabase};
+
+#[derive(Debug)]
+pub enum DatabaseError {
+    ConnectionPoolFailed,
+    FailedToAcquireTransaction,
+    FailedToCommitTransaction,
+    SetupFailed { step: &'static str, reason: String },
+    SchemaHashComputationFailed,
+    SqlxError(sqlx::Error),
+    BackfillFailed { table: String, reason: &'static str },
+}
+
+impl fmt::Display for DatabaseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            DatabaseError::ConnectionPoolFailed => {
+                write!(f, "failed to create connection pool")
+            }
+            DatabaseError::FailedToAcquireTransaction => {
+                write!(f, "failed to acquire transaction")
+            }
+            DatabaseError::FailedToCommitTransaction => {
+                write!(f, "failed to commit transaction")
+            }
+            DatabaseError::SetupFailed { step, reason } => {
+                write!(f, "setup failed while {step}: {reason}")
+            }
+            DatabaseError::SchemaHashComputationFailed => {
+                write!(f, "failed to compute schema hash")
+            }
+            DatabaseError::SqlxError(err) => {
+                write!(f, "sqlx error: {}", err)
+            }
+            DatabaseError::BackfillFailed { table, reason } => {
+                write!(f, "backfill failed for table {table}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatabaseError {}
