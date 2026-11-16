@@ -126,9 +126,21 @@ impl<'a> SqliteDatabase<'a> {
     pub async fn bytes(mut self) -> Result<Vec<u8>, DatabaseError> {
         self.setup_triggers().await?;
 
-        let _ = sqlx::raw_sql("PRAGMA wal_checkpoint(TRUNCATE);")
-            .execute(&self.pool)
-            .await;
+        let (busy, _log, _checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|err| DatabaseError::SetupFailed {
+                    step: "checkpointing sqlite database",
+                    reason: err.to_string(),
+                })?;
+
+        if busy != 0 {
+            return Err(DatabaseError::SetupFailed {
+                step: "checkpointing sqlite database",
+                reason: "checkpoint could not complete (database busy)".into(),
+            });
+        }
 
         self.pool.close().await;
 
