@@ -14,3 +14,5 @@
 
 ### Secrets
 *.env.*
+
+dev_artifacts

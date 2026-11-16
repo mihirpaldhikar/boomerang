@@ -112,13 +112,13 @@ impl<'a> SqliteDatabase<'a> {
             _database_file: Some(Arc::new(database_file)),
         };
 
+        instance.drop_triggers().await?;
+
         match instance.stored_schema_hash().await {
             Some(stored) if &stored == ref_schema.hash() => {}
             Some(_) => instance.alter_tables().await?,
             None => instance.create_tables().await?,
         }
-
-        instance.drop_triggers().await?;
 
         Ok(instance)
     }
