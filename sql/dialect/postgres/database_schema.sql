@@ -212,3 +212,22 @@ WHERE t.relkind IN ('r', 'p')
   AND i.indisvalid
 ORDER BY t.relname, ic.relname;
 $$;
+
+CREATE
+OR REPLACE FUNCTION boomerang.meta()
+RETURNS TABLE (
+    identity          bytea,
+    system_identifier bigint,
+    database_oid      oid,
+    server_version    integer
+)
+LANGUAGE sql STABLE PARALLEL SAFE
+AS $$
+SELECT sha256(convert_to(format('boomerang/v1|%s|%s', s.system_identifier, d.oid), 'UTF8')),
+       s.system_identifier,
+       d.oid,
+       current_setting('server_version_num') ::integer
+FROM pg_control_system() s,
+     pg_database d
+WHERE d.datname = current_database();
+$$;

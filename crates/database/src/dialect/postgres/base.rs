@@ -80,6 +80,16 @@ impl PostgresDatabase {
         })
     }
 
+    pub async fn identity(&self) -> Result<[u8; 32], DatabaseError> {
+        let bytes: Vec<u8> = sqlx::query_scalar("SELECT identity FROM boomerang.meta()")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DatabaseError::SqlxError)?;
+        bytes
+            .try_into()
+            .map_err(|_| DatabaseError::SchemaHashComputationFailed)
+    }
+
     pub fn schema(&self) -> &DatabaseSchema {
         &self.schema
     }
@@ -145,7 +155,7 @@ impl PostgresDatabase {
             ON p.pronamespace = n.oid
         WHERE p.prokind = 'f'
           AND n.nspname = 'boomerang'
-          AND p.proname IN ('database_schema', 'database_indexes');
+          AND p.proname IN ('database_schema', 'database_indexes', 'meta');
         "#,
         )
         .fetch_one(&mut **tx)
