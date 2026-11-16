@@ -19,10 +19,70 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+use crate::cli::{Cli, Commands};
+use crate::config::BoomerangConfig;
+use clap::{CommandFactory, Parser};
+use yamlite::FromYaml;
+
+mod cli;
+mod config;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn main() {
-    println!("Hello from Boomerang!");
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    let config_path = cli.config.unwrap_or_else(|| {
+        Cli::command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required arguments were not provided:\n  --config <FILE>",
+            )
+            .exit()
+    });
+
+    let config_file = match tokio::fs::read_to_string(config_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    eprintln!("config file not found")
+                }
+                _ => {
+                    eprintln!("failed to read config file");
+                }
+            }
+            std::process::exit(1);
+        }
+    };
+
+    let cfg = match BoomerangConfig::from_yaml(&config_file) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("config error: {}", e.message);
+            std::process::exit(1);
+        }
+    };
+
+    let pg = match database::PostgresDatabase::new(cfg.database.url).await {
+        Ok(pg) => pg,
+        Err(e) => {
+            eprintln!("database error: {}", e.to_string());
+            std::process::exit(1);
+        }
+    };
+
+    match cli.command {
+        Commands::Start => {
+            println!("Hello from boomerang!")
+        }
+        Commands::Prune => {
+            if let Err(e) = pg.remove_setup().await {
+                eprintln!("pruning failed: {}", e.to_string());
+            }
+            println!("all the tables, triggers related to boomerang have been removed.")
+        }
+    }
 }
