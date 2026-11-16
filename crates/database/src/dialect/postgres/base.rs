@@ -20,13 +20,16 @@
  * SOFTWARE.
  */
 use crate::DatabaseError;
-use crate::core::{Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, Lit, RawForeignKey};
+use crate::core::{
+    Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, Lit, RawForeignKey, RawIndex, RawIndexKey,
+};
 use futures::TryStreamExt;
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 
-const DATABASE_SCHEMA_QUERY: &'static str = include_str!("../../../../../sql/database_schema.sql");
+const DATABASE_SCHEMA_QUERY: &'static str =
+    include_str!("../../../../../sql/dialect/postgres/database_schema.sql");
 
 pub struct PostgresDatabase {
     pool: sqlx::Pool<sqlx::Postgres>,
@@ -133,14 +136,16 @@ impl PostgresDatabase {
     ) -> Result<(), DatabaseError> {
         match sqlx::query_scalar::<_, bool>(
             r#"
-            SELECT count(p.proname) = 1
-            FROM pg_catalog.pg_namespace n
-                     JOIN
-                 pg_catalog.pg_proc p ON
-                     p.pronamespace = n.oid
-            WHERE p.prokind = 'f'
-              AND n.nspname = 'boomerang'
-              AND p.proname = 'database_schema';
+            SELECT
+            count(*) FILTER (WHERE p.proname = 'database_schema') = 1
+            AND
+            count(*) FILTER (WHERE p.proname = 'database_index') = 1 AS functions_exist
+        FROM pg_catalog.pg_namespace n
+        JOIN pg_catalog.pg_proc p
+            ON p.pronamespace = n.oid
+        WHERE p.prokind = 'f'
+          AND n.nspname = 'boomerang'
+          AND p.proname IN ('database_schema', 'database_indexes');
         "#,
         )
         .fetch_one(&mut **tx)
@@ -262,15 +267,90 @@ impl PostgresDatabase {
             }
         }
 
+        {
+            let mut rows =
+                sqlx::query("SELECT * FROM boomerang.database_indexes('public');").fetch(&mut **tx);
+
+            while let Some(row) = rows.try_next().await.map_err(DatabaseError::SqlxError)? {
+                use sqlx::Row;
+                let g = |e| DatabaseError::SqlxError(e);
+
+                let table_name: String = row.try_get("table_name").map_err(g)?;
+                let index_name: String = row.try_get("index_name").map_err(g)?;
+                let method: String = row.try_get("method").map_err(g)?;
+                let predicate: Option<String> = row.try_get("predicate").map_err(g)?;
+
+                let key_defs: Vec<String> = row
+                    .try_get::<Option<Vec<String>>, _>("key_defs")
+                    .map_err(g)?
+                    .unwrap_or_default();
+                let key_is_expr: Vec<bool> = row
+                    .try_get::<Option<Vec<bool>>, _>("key_is_expr")
+                    .map_err(g)?
+                    .unwrap_or_default();
+                let key_is_desc: Vec<bool> = row
+                    .try_get::<Option<Vec<bool>>, _>("key_is_desc")
+                    .map_err(g)?
+                    .unwrap_or_default();
+                let include_defs: Vec<String> = row
+                    .try_get::<Option<Vec<String>>, _>("include_defs")
+                    .map_err(g)?
+                    .unwrap_or_default();
+
+                let keys = key_defs
+                    .iter()
+                    .zip(&key_is_expr)
+                    .zip(&key_is_desc)
+                    .map(|((d, &e), &s)| RawIndexKey {
+                        def: d,
+                        is_expr: e,
+                        is_desc: s,
+                    })
+                    .collect();
+                let includes = include_defs
+                    .iter()
+                    .map(|d| RawIndexKey {
+                        def: d,
+                        is_expr: false,
+                        is_desc: false,
+                    })
+                    .collect();
+
+                builder.add_index(
+                    &table_name,
+                    RawIndex {
+                        name: &index_name,
+                        is_unique: row.try_get("is_unique").map_err(g)?,
+                        is_primary: row.try_get("is_primary").map_err(g)?,
+                        is_constraint: row.try_get("is_constraint").map_err(g)?,
+                        method: &method,
+                        keys,
+                        includes,
+                        predicate: predicate.as_deref(),
+                    },
+                );
+            }
+        }
+
         let schema_hash: [u8; 32] = match sqlx::query_scalar(
             r#"
-            SELECT sha256(convert_to(coalesce(string_agg(r.j, E'\n' ORDER BY r.table_name, r.ord), ''), 'UTF8'))
-            FROM (
-                SELECT s.table_name,
-                       row_number() OVER (PARTITION BY s.table_name ORDER BY s.attnum) AS ord,
-                       (to_jsonb(s) - 'attnum')::text AS j
-                FROM boomerang.database_schema('public') s
-            ) r"#,
+                SELECT sha256(convert_to(
+                    coalesce((
+                        SELECT string_agg(r.j, E'\n' ORDER BY r.table_name, r.ord)
+                        FROM (
+                            SELECT s.table_name,
+                                   row_number() OVER (PARTITION BY s.table_name ORDER BY s.attnum) AS ord,
+                                   (to_jsonb(s) - 'attnum')::text AS j
+                            FROM boomerang.database_schema('public') s
+                        ) r
+                    ), '')
+                    || E'\n--indexes--\n' ||
+                    coalesce((
+                        SELECT string_agg(to_jsonb(i)::text, E'\n' ORDER BY i.table_name, i.index_name)
+                        FROM boomerang.database_indexes('public') i
+                    ), ''),
+                    'UTF8'))
+    "#,
         )
             .fetch_one(&mut **tx)
             .await

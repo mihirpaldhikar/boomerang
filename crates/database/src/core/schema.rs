@@ -184,6 +184,29 @@ impl ColumnFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct IndexFlags(u8);
+
+impl IndexFlags {
+    pub const UNIQUE: Self = Self(1);
+    pub const PRIMARY: Self = Self(1 << 1);
+    pub const CONSTRAINT: Self = Self(1 << 2);
+
+    #[inline]
+    pub const fn contains(self, o: Self) -> bool {
+        self.0 & o.0 == o.0
+    }
+    #[inline]
+    pub const fn set(&mut self, o: Self, on: bool) {
+        if on { self.0 |= o.0 } else { self.0 &= !o.0 }
+    }
+    #[inline]
+    pub(crate) const fn from_bits(b: u8) -> Self {
+        Self(b)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PoolRange {
     pub(crate) start: u32,
@@ -194,6 +217,94 @@ impl PoolRange {
     #[inline]
     pub(crate) fn as_range(self) -> std::ops::Range<usize> {
         self.start as usize..self.start as usize + self.len as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IndexKey {
+    pub(crate) def: Symbol,
+    pub(crate) flags: u8,
+}
+
+impl IndexKey {
+    #[inline]
+    pub fn def(&self) -> Symbol {
+        self.def
+    }
+    #[inline]
+    pub fn is_expr(&self) -> bool {
+        self.flags & 1 != 0
+    }
+    #[inline]
+    pub fn is_desc(&self) -> bool {
+        self.flags & 2 != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMeta {
+    pub(crate) name: Symbol,
+    pub(crate) flags: IndexFlags,
+    pub(crate) method: Symbol,
+    pub(crate) keys: PoolRange,
+    pub(crate) includes: PoolRange,
+    pub(crate) predicate: Option<Symbol>,
+}
+
+#[derive(Clone, Copy)]
+pub struct IndexRef<'a> {
+    pub(crate) schema: &'a DatabaseSchema,
+    pub(crate) index: usize,
+}
+
+impl<'a> IndexRef<'a> {
+    #[inline]
+    fn meta(&self) -> &'a IndexMeta {
+        &self.schema.index_pool[self.index]
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.schema
+            .interner
+            .resolve(self.meta().name)
+            .expect("index symbol not from the schema")
+    }
+    pub fn method(&self) -> &'a str {
+        self.schema
+            .interner
+            .resolve(self.meta().method)
+            .expect("method symbol not from the schema")
+    }
+    #[inline]
+    pub fn is_unique(&self) -> bool {
+        self.meta().flags.contains(IndexFlags::UNIQUE)
+    }
+    #[inline]
+    pub fn is_primary(&self) -> bool {
+        self.meta().flags.contains(IndexFlags::PRIMARY)
+    }
+    #[inline]
+    pub fn is_constraint(&self) -> bool {
+        self.meta().flags.contains(IndexFlags::CONSTRAINT)
+    }
+    #[inline]
+    pub fn keys(&self) -> &'a [IndexKey] {
+        &self.schema.index_key_pool[self.meta().keys.as_range()]
+    }
+    #[inline]
+    pub fn includes(&self) -> &'a [IndexKey] {
+        &self.schema.index_key_pool[self.meta().includes.as_range()]
+    }
+    pub fn predicate(&self) -> Option<&'a str> {
+        self.meta()
+            .predicate
+            .and_then(|s| self.schema.interner.resolve(s))
+    }
+    pub fn key_text(&self, key: &IndexKey) -> &'a str {
+        self.schema
+            .interner
+            .resolve(key.def)
+            .expect("key symbol not from the schema")
     }
 }
 
@@ -249,6 +360,8 @@ pub(crate) struct TableMeta {
     pub(crate) primary_key: Option<u16>,
     pub(crate) fk_start: u32,
     pub(crate) fk_len: u16,
+    pub(crate) index_start: u32,
+    pub(crate) index_len: u16,
 }
 
 pub struct DatabaseSchema {
@@ -258,6 +371,8 @@ pub struct DatabaseSchema {
     pub(crate) column_names: Box<[Symbol]>,
     pub(crate) constraint_pool: Box<[Symbol]>,
     pub(crate) foreign_key_pool: Box<[ForeignKey]>,
+    pub(crate) index_pool: Box<[IndexMeta]>,
+    pub(crate) index_key_pool: Box<[IndexKey]>,
     pub(crate) hash: [u8; 32],
     pub(crate) interner: StringInterner,
 }
@@ -419,6 +534,13 @@ impl<'a> TableRef<'a> {
             index: fk.table,
         }
     }
+
+    pub fn indexes(&self) -> impl ExactSizeIterator<Item = IndexRef<'a>> {
+        let m = self.meta();
+        let schema = self.schema;
+        (m.index_start as usize..m.index_start as usize + m.index_len as usize)
+            .map(move |index| IndexRef { schema, index })
+    }
 }
 
 impl DatabaseSchema {
@@ -516,12 +638,15 @@ impl DatabaseSchema {
         let interner_bytes = self.interner.bytes();
 
         let mut estimated_cap = 32 // hash
+            + 4 // magic
             + 4 + interner_bytes.len() // interner
-            + 4 + self.tables.len() * 18 // tables
+            + 4 + self.tables.len() * 24 // tables (18 + index_start 4 + index_len 2)
             + 4 + self.by_name.len() * 2 // by_name
             + 4 + self.column_names.len() * 4 // column_names
             + 4 + self.constraint_pool.len() * 4 // constraint_pool
-            + 4 + self.foreign_key_pool.len() * 14; // foreign_keys
+            + 4 + self.foreign_key_pool.len() * 14 // foreign_keys
+            + 4 + self.index_key_pool.len() * 5 // index keys (sym 4 + flags 1)
+            + 4 + self.index_pool.len() * 25; // indexes (see below)
 
         estimated_cap += 4 + self.columns.len() * 40;
 
@@ -569,6 +694,8 @@ impl DatabaseSchema {
             write_u16!(t.primary_key.unwrap_or(u16::MAX));
             write_u32!(t.fk_start);
             write_u16!(t.fk_len);
+            write_u32!(t.index_start);
+            write_u16!(t.index_len);
         }
 
         write_u32!(self.by_name.len());
@@ -615,6 +742,24 @@ impl DatabaseSchema {
             write_u16!(fk.column);
             write_u8!(fk.on_update);
             write_u8!(fk.on_delete);
+        }
+
+        write_u32!(self.index_key_pool.len());
+        for k in self.index_key_pool.iter() {
+            write_sym!(k.def);
+            write_u8!(k.flags);
+        }
+
+        write_u32!(self.index_pool.len());
+        for ix in self.index_pool.iter() {
+            write_sym!(ix.name);
+            write_u8!(ix.flags.0);
+            write_sym!(ix.method);
+            write_u32!(ix.keys.start);
+            write_u16!(ix.keys.len);
+            write_u32!(ix.includes.start);
+            write_u16!(ix.includes.len);
+            write_sym_opt!(ix.predicate);
         }
 
         buf
@@ -686,6 +831,8 @@ impl DatabaseSchema {
                 },
                 fk_start: read_u32!(),
                 fk_len: read_u16!(),
+                index_start: read_u32!(),
+                index_len: read_u16!(),
             });
         }
 
@@ -774,10 +921,51 @@ impl DatabaseSchema {
             });
         }
 
+        let ik_len = read_u32!();
+        let mut index_key_pool = Vec::with_capacity(ik_len as usize);
+        for _ in 0..ik_len {
+            index_key_pool.push(IndexKey {
+                def: read_sym!(),
+                flags: read_u8!(),
+            });
+        }
+
+        let ix_len = read_u32!();
+        let mut index_pool = Vec::with_capacity(ix_len as usize);
+        for _ in 0..ix_len {
+            index_pool.push(IndexMeta {
+                name: read_sym!(),
+                flags: IndexFlags::from_bits(read_u8!()),
+                method: read_sym!(),
+                keys: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
+                includes: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
+                predicate: read_sym_opt!(),
+            });
+        }
+
         let pool_len = constraint_pool.len();
         for c in &columns {
             for r in [c.constraints, c.enum_labels, c.domain_checks] {
                 if r.start as usize + r.len as usize > pool_len {
+                    return None;
+                }
+            }
+        }
+
+        for t in &tables {
+            if t.index_start as usize + t.index_len as usize > index_pool.len() {
+                return None;
+            }
+        }
+        for ix in &index_pool {
+            for r in [ix.keys, ix.includes] {
+                if r.start as usize + r.len as usize > index_key_pool.len() {
                     return None;
                 }
             }
@@ -791,6 +979,8 @@ impl DatabaseSchema {
             column_names: column_names.into_boxed_slice(),
             constraint_pool: constraint_pool.into_boxed_slice(),
             foreign_key_pool: foreign_key_pool.into_boxed_slice(),
+            index_key_pool: index_key_pool.into_boxed_slice(),
+            index_pool: index_pool.into_boxed_slice(),
             hash,
         })
     }
@@ -874,6 +1064,8 @@ impl DatabaseSchema {
                     },
                     fk_start: read_u32!(),
                     fk_len: read_u16!(),
+                    index_start: read_u32!(),
+                    index_len: read_u16!(),
                 }
             );
 
@@ -944,6 +1136,34 @@ impl DatabaseSchema {
                 }
             );
 
+            let index_key_pool = read_vec!(
+                IndexKey,
+                read_u32!(),
+                IndexKey {
+                    def: read_sym!(),
+                    flags: read_u8!()
+                }
+            );
+
+            let index_pool = read_vec!(
+                IndexMeta,
+                read_u32!(),
+                IndexMeta {
+                    name: read_sym!(),
+                    flags: IndexFlags::from_bits(read_u8!()),
+                    method: read_sym!(),
+                    keys: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                    includes: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                    predicate: read_sym_opt!(),
+                }
+            );
+
             DatabaseSchema {
                 interner,
                 tables,
@@ -952,6 +1172,8 @@ impl DatabaseSchema {
                 column_names,
                 constraint_pool,
                 foreign_key_pool,
+                index_key_pool,
+                index_pool,
                 hash,
             }
         }

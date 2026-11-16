@@ -158,3 +158,57 @@ FROM tables t
          LEFT JOIN domain_checks dc ON dc.typ_oid = a.atttypid
 ORDER BY t.relname, a.attnum;
 $$;
+
+CREATE
+OR REPLACE FUNCTION boomerang.database_indexes(
+    p_namespace   text   DEFAULT 'public',
+    p_skip_tables text[] DEFAULT '{}'
+)
+    RETURNS TABLE (
+        table_name    text,
+        index_name    text,
+        is_unique     boolean,
+        is_primary    boolean,
+        is_constraint boolean,
+        method        text,
+        key_defs      text[],
+        key_is_expr   boolean[],
+        key_is_desc   boolean[],
+        include_defs  text[],
+        predicate     text
+    )
+    LANGUAGE sql STABLE PARALLEL SAFE
+AS $$
+SELECT t.relname::text, ic.relname::text, i.indisunique,
+       i.indisprimary,
+       EXISTS (SELECT 1
+               FROM pg_constraint con
+               WHERE con.conindid = i.indexrelid
+                 AND con.conrelid = i.indrelid
+                 AND con.contype IN ('p', 'u', 'x')),
+       am.amname::text, k.defs,
+       k.is_expr,
+       k.is_desc,
+       inc.defs,
+       pg_get_expr(i.indpred, i.indrelid)
+FROM pg_index i
+         JOIN pg_class t ON t.oid = i.indrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         JOIN pg_class ic ON ic.oid = i.indexrelid
+         JOIN pg_am am ON am.oid = ic.relam
+         CROSS JOIN LATERAL (
+    SELECT array_agg(pg_get_indexdef(i.indexrelid, g, true) ORDER BY g) AS defs,
+           array_agg(i.indkey[g - 1] = 0 ORDER BY g)                    AS is_expr,
+           array_agg((i.indoption[g - 1] & 1) = 1 ORDER BY g)           AS is_desc
+    FROM generate_series(1, i.indnkeyatts::int) AS g
+        ) k
+         CROSS JOIN LATERAL (
+    SELECT array_agg(pg_get_indexdef(i.indexrelid, g, true) ORDER BY g) AS defs
+    FROM generate_series(i.indnkeyatts::int + 1, i.indnatts::int) AS g
+        ) inc
+WHERE t.relkind IN ('r', 'p')
+  AND n.nspname = p_namespace
+  AND t.relname <> ALL (COALESCE(p_skip_tables, '{}'))
+  AND i.indisvalid
+ORDER BY t.relname, ic.relname;
+$$;

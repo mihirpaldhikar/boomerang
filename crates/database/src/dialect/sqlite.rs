@@ -1,6 +1,6 @@
-use crate::{DatabaseError, Symbol};
-use crate::core::{ColumnRef, DatabaseSchema, Ident, Lit, TableRef, ValueType};
+use crate::core::{ColumnRef, DatabaseSchema, Ident, IndexRef, Lit, TableRef, ValueType};
 use crate::dialect::postgres::{CheckOpts, translate_check};
+use crate::{DatabaseError, Symbol};
 use hashbrown::HashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, Pool, Sqlite};
@@ -260,8 +260,27 @@ impl<'a> SqliteDatabase<'a> {
         }
         let live_tables: Vec<&str> = existing.keys().copied().collect();
 
+        let stale_indexes: Vec<String> = sqlx::query_scalar(
+            r#"SELECT name FROM sqlite_master
+       WHERE type = 'index'
+         AND sql IS NOT NULL
+         AND name NOT LIKE 'sqlite\_%' ESCAPE '\'
+         AND name NOT LIKE '\_\_uniq\_%' ESCAPE '\'
+         AND tbl_name NOT IN ('__sync_log__', '__meta__')"#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| DatabaseError::SetupFailed {
+            step: "listing sqlite indexes",
+            reason: err.to_string(),
+        })?;
+
         let schema = self.schema;
         let mut sql = String::with_capacity(512 + schema.columns.len() * 24);
+
+        for name in &stale_indexes {
+            let _ = writeln!(sql, "DROP INDEX IF EXISTS {};", Ident(name));
+        }
 
         for table in schema.tables() {
             let table_name = table.name();
@@ -333,6 +352,12 @@ impl<'a> SqliteDatabase<'a> {
             for (column, _) in live_cols {
                 let _ = writeln!(
                     sql,
+                    "DROP INDEX IF EXISTS {};",
+                    Ident(&format!("__uniq_{table_name}_{column}__")),
+                );
+
+                let _ = writeln!(
+                    sql,
                     "ALTER TABLE {} DROP COLUMN {};",
                     Ident(table_name),
                     Ident(column),
@@ -342,6 +367,10 @@ impl<'a> SqliteDatabase<'a> {
 
         for (table, _) in existing {
             let _ = writeln!(sql, "DROP TABLE IF EXISTS {};", Ident(table));
+        }
+
+        for table in schema.tables() {
+            Self::write_indexes(&mut sql, table);
         }
 
         Self::write_hash_upsert(&mut sql, schema.hash());
@@ -445,11 +474,13 @@ impl<'a> SqliteDatabase<'a> {
         let mut sql = String::with_capacity(
             256 + schema.len() * 96
                 + schema.columns.len() * 64
-                + schema.foreign_key_pool.len() * 96,
+                + schema.foreign_key_pool.len() * 96
+                + schema.index_pool.len() * 128,
         );
 
         for table in schema.tables() {
             Self::write_create_table(&mut sql, schema, table);
+            Self::write_indexes(&mut sql, table);
         }
 
         sql.push_str(SYNC_LOG_DDL);
@@ -469,8 +500,15 @@ impl<'a> SqliteDatabase<'a> {
     fn write_create_table(sql: &mut String, schema: &DatabaseSchema, table: TableRef<'_>) {
         let _ = write!(sql, "CREATE TABLE IF NOT EXISTS {} (", Ident(table.name()));
 
-        let pk_count = table.columns().filter(|c| c.is_primary_key()).count();
-        let composite_pk = pk_count > 1;
+        let pk_cols: Vec<&str> = match table.indexes().find(|i| i.is_primary()) {
+            Some(ix) => ix.keys().iter().map(|k| ix.key_text(k)).collect(),
+            None => table
+                .columns()
+                .filter(|c| c.is_primary_key())
+                .map(|c| c.name())
+                .collect(),
+        };
+        let composite_pk = pk_cols.len() > 1;
 
         let mut first = true;
         for column in table.columns() {
@@ -576,7 +614,7 @@ impl<'a> SqliteDatabase<'a> {
             let col_ident = Ident(column.name()).to_string();
 
             let labels: Vec<&str> = column
-                .constraints()
+                .enum_labels()
                 .iter()
                 .filter_map(|&s| schema.resolve_symbol(s))
                 .collect();
@@ -723,5 +761,97 @@ impl<'a> SqliteDatabase<'a> {
             }
             None => eprintln!("sqlite: skipping untranslatable CHECK on {table}.{col}: {def}"),
         }
+    }
+}
+
+impl<'a> SqliteDatabase<'a> {
+    fn write_indexes(sql: &mut String, table: TableRef<'_>) {
+        for index in table.indexes() {
+            if let Some(stmt) = Self::index_ddl(&index, table.name()) {
+                sql.push_str(&stmt);
+            }
+        }
+    }
+
+    fn index_ddl(index: &IndexRef<'_>, table: &str) -> Option<String> {
+        let name = index.name();
+        let unique = index.is_unique();
+        let keys = index.keys();
+
+        if index.is_primary() {
+            return None;
+        }
+
+        if index.is_constraint() && !unique {
+            eprintln!("sqlite: skipping EXCLUDE constraint index {name} on {table}");
+            return None;
+        }
+
+        if unique && keys.len() == 1 && !keys[0].is_expr() && index.predicate().is_none() {
+            return None;
+        }
+
+        if !matches!(index.method(), "btree" | "hash") {
+            eprintln!(
+                "sqlite: skipping {} index {name} on {table}",
+                index.method()
+            );
+            return None;
+        }
+
+        let mut cols: Vec<String> = Vec::with_capacity(keys.len() + index.includes().len());
+        for key in keys {
+            let text = index.key_text(key);
+            let mut part = if key.is_expr() {
+                match translate_check(text, None, &CHECK_OPTS) {
+                    Some(expr) => expr,
+                    None => {
+                        eprintln!(
+                            "sqlite: skipping index {name} on {table}: untranslatable expression {text}"
+                        );
+                        return None;
+                    }
+                }
+            } else {
+                Ident(text).to_string()
+            };
+            if key.is_desc() {
+                part.push_str(" DESC");
+            }
+            cols.push(part);
+        }
+
+        if !unique {
+            for inc in index.includes() {
+                cols.push(Ident(index.key_text(inc)).to_string());
+            }
+        }
+
+        let mut where_clause = String::new();
+        if let Some(pred) = index.predicate() {
+            match translate_check(pred, None, &CHECK_OPTS) {
+                Some(expr) => where_clause = format!(" WHERE {expr}"),
+                None if unique => {
+                    eprintln!(
+                        "sqlite: skipping unique index {name} on {table}: untranslatable predicate {pred}"
+                    );
+                    return None;
+                }
+                None => {
+                    eprintln!(
+                        "sqlite: index {name} on {table}: dropping untranslatable predicate {pred}"
+                    );
+                }
+            }
+        }
+
+        Some(format!(
+            "CREATE {}INDEX IF NOT EXISTS {} ON {} ({}){};\n",
+            if unique { "UNIQUE " } else { "" },
+            Ident(name),
+            Ident(table),
+            cols.join(","),
+            where_clause,
+        ))
     }
 }

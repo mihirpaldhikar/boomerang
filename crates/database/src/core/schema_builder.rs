@@ -20,13 +20,14 @@
  * SOFTWARE.
  */
 use crate::core::schema::{
-    Action, Column, ColumnFlags, DatabaseSchema, ForeignKey, PoolRange, TableMeta,
+    Action, Column, ColumnFlags, DatabaseSchema, ForeignKey, IndexFlags, IndexKey, IndexMeta,
+    PoolRange, TableMeta,
 };
 use crate::core::value::ValueType;
 use crate::{StringInterner, Symbol};
 use std::collections::VecDeque;
 
-pub struct RawForeignKey<'a> {
+pub(crate) struct RawForeignKey<'a> {
     pub constraint_name: &'a str,
     pub namespace: &'a str,
     pub referenced_table: &'a str,
@@ -42,6 +43,28 @@ struct UnresolvedFk {
     ref_column_sym: Symbol,
 }
 
+pub(crate) struct RawIndexKey<'a> {
+    pub def: &'a str,
+    pub is_expr: bool,
+    pub is_desc: bool,
+}
+
+pub(crate) struct RawIndex<'a> {
+    pub name: &'a str,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub is_constraint: bool,
+    pub method: &'a str,
+    pub keys: Vec<RawIndexKey<'a>>,
+    pub includes: Vec<RawIndexKey<'a>>,
+    pub predicate: Option<&'a str>,
+}
+
+struct PendingIndex {
+    table: Symbol,
+    meta: IndexMeta,
+}
+
 #[derive(Default)]
 pub struct DatabaseSchemaBuilder {
     interner: StringInterner,
@@ -50,6 +73,8 @@ pub struct DatabaseSchemaBuilder {
     column_names: Vec<Symbol>,
     constraint_pool: Vec<Symbol>,
     foreign_key_pool: Vec<ForeignKey>,
+    index_key_pool: Vec<IndexKey>,
+    pending_indexes: Vec<PendingIndex>,
 
     // Current Table grouping state
     current_table: Option<Symbol>,
@@ -70,6 +95,8 @@ impl DatabaseSchemaBuilder {
             column_names: Vec::with_capacity(columns_cap),
             constraint_pool: Vec::with_capacity(columns_cap * 2),
             foreign_key_pool: Vec::with_capacity(tables_cap * 2),
+            index_key_pool: Vec::with_capacity(tables_cap * 2),
+            pending_indexes: Vec::with_capacity(tables_cap * 2),
             current_table: None,
             current_table_cols_start: 0,
             current_table_fk_start: 0,
@@ -202,6 +229,63 @@ impl DatabaseSchemaBuilder {
         }
     }
 
+    fn unquote_ident(s: &str) -> String {
+        match s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+            Some(inner) => inner.replace("\"\"", "\""),
+            None => s.to_string(),
+        }
+    }
+
+    fn push_index_keys<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = RawIndexKey<'a>>,
+    ) -> PoolRange {
+        let start = self.index_key_pool.len() as u32;
+        for k in keys {
+            let text = if k.is_expr {
+                k.def.to_string()
+            } else {
+                Self::unquote_ident(k.def)
+            };
+            let def = self.interner.get_or_intern(text.as_str());
+            self.index_key_pool.push(IndexKey {
+                def,
+                flags: (k.is_expr as u8) | ((k.is_desc as u8) << 1),
+            });
+        }
+        PoolRange {
+            start,
+            len: (self.index_key_pool.len() as u32 - start) as u16,
+        }
+    }
+
+    pub fn add_index<'a>(&mut self, table_name: &str, index: RawIndex<'a>) {
+        let table = self.interner.get_or_intern(table_name);
+        let name = self.interner.get_or_intern(index.name);
+        let method = self.interner.get_or_intern(index.method);
+
+        let mut flags = IndexFlags::default();
+        flags.set(IndexFlags::UNIQUE, index.is_unique);
+        flags.set(IndexFlags::PRIMARY, index.is_primary);
+        flags.set(IndexFlags::CONSTRAINT, index.is_constraint);
+
+        let keys = self.push_index_keys(index.keys);
+        let includes = self.push_index_keys(index.includes);
+        let predicate = index.predicate.map(|p| self.interner.get_or_intern(p));
+
+        self.pending_indexes.push(PendingIndex {
+            table,
+            meta: IndexMeta {
+                name,
+                flags,
+                method,
+                keys,
+                includes,
+                predicate,
+            },
+        });
+    }
+
     #[inline]
     fn finish_table(&mut self) {
         if let Some(name) = self.current_table {
@@ -215,6 +299,8 @@ impl DatabaseSchemaBuilder {
                 primary_key: self.current_table_pk,
                 fk_start: self.current_table_fk_start,
                 fk_len,
+                index_start: 0,
+                index_len: 0,
             });
         }
     }
@@ -225,6 +311,28 @@ impl DatabaseSchemaBuilder {
 
         let mut old_by_name: Vec<u16> = (0..num_tables as u16).collect();
         old_by_name.sort_unstable_by_key(|&i| self.tables[i as usize].name);
+
+        let mut pending = std::mem::take(&mut self.pending_indexes);
+        let mut resolved: Vec<(usize, IndexMeta)> = pending
+            .drain(..)
+            .filter_map(|p| {
+                let slot = old_by_name
+                    .binary_search_by_key(&p.table, |&i| self.tables[i as usize].name)
+                    .ok()?;
+                Some((old_by_name[slot] as usize, p.meta))
+            })
+            .collect();
+        resolved.sort_by_key(|(t, _)| *t);
+
+        let mut index_pool: Vec<IndexMeta> = Vec::with_capacity(resolved.len());
+        for (t_idx, meta) in resolved {
+            let tm = &mut self.tables[t_idx];
+            if tm.index_len == 0 {
+                tm.index_start = index_pool.len() as u32;
+            }
+            tm.index_len += 1;
+            index_pool.push(meta);
+        }
 
         let mut in_degree = vec![0; num_tables];
         let mut graph = vec![Vec::new(); num_tables];
@@ -375,6 +483,8 @@ impl DatabaseSchemaBuilder {
             column_names: self.column_names.into_boxed_slice(),
             constraint_pool: self.constraint_pool.into_boxed_slice(),
             foreign_key_pool: valid_fks.into_boxed_slice(),
+            index_pool: index_pool.into_boxed_slice(),
+            index_key_pool: self.index_key_pool.into_boxed_slice(),
             hash,
         }
     }
