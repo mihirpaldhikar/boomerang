@@ -1,0 +1,13 @@
+[package]
+name = "yamlite"
+version = "0.0.1"
+edition = "2024"
+authors = ["Mihir Paldhikar"]
+
+[features]
+default = ["std", "derive"]
+std = []
+derive = ["dep:yamlite_macros"]
+
+[dependencies]
+yamlite_macros = { path = "macros", optional = true }

@@ -12,3 +12,4 @@ path = "src/main.rs"
 mimalloc.workspace = true
 tokio.workspace = true
 database.workspace = true
+yamlite.workspace = true
