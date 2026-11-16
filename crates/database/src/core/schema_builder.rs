@@ -89,6 +89,7 @@ impl DatabaseSchemaBuilder {
         default_expr: Option<&'a str>,
         foreign_keys: impl IntoIterator<Item = RawForeignKey<'a>>,
         check_defs: impl IntoIterator<Item = &'a str>,
+        enum_labels: impl IntoIterator<Item = &'a str>,
         domain_checks: impl IntoIterator<Item = &'a str>,
     ) {
         let t_sym = self.interner.get_or_intern(table_name);
@@ -113,11 +114,9 @@ impl DatabaseSchemaBuilder {
             self.current_table_pk = Some(col_idx_in_table);
         }
 
-        let constraints_start = self.constraint_pool.len() as u32;
-        for chk in check_defs.into_iter().chain(domain_checks) {
-            self.constraint_pool.push(self.interner.get_or_intern(chk));
-        }
-        let constraints_len = (self.constraint_pool.len() as u32 - constraints_start) as u16;
+        let constraints = self.push_symbols(check_defs);
+        let enum_labels = self.push_symbols(enum_labels);
+        let domain_checks = self.push_symbols(domain_checks);
 
         let fks_start = self.foreign_key_pool.len() as u32;
         for fk in foreign_keys {
@@ -178,17 +177,29 @@ impl DatabaseSchemaBuilder {
             data_type,
             default_value: default_expr.map(|d| self.interner.get_or_intern(d)),
             flags,
-            constraints: PoolRange {
-                start: constraints_start,
-                len: constraints_len,
-            },
+            constraints,
             foreign_keys: PoolRange {
                 start: fks_start,
                 len: fks_len,
             },
+            enum_labels,
+            domain_checks,
         });
 
         self.column_names.push(col_sym);
+    }
+
+    #[inline]
+    fn push_symbols<'a>(&mut self, items: impl IntoIterator<Item = &'a str>) -> PoolRange {
+        let start = self.constraint_pool.len() as u32;
+        for s in items {
+            let sym = self.interner.get_or_intern(s);
+            self.constraint_pool.push(sym);
+        }
+        PoolRange {
+            start,
+            len: (self.constraint_pool.len() as u32 - start) as u16,
+        }
     }
 
     #[inline]

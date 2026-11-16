@@ -1,5 +1,6 @@
-use crate::DatabaseError;
+use crate::{DatabaseError, Symbol};
 use crate::core::{ColumnRef, DatabaseSchema, Ident, Lit, TableRef, ValueType};
+use crate::dialect::postgres::{CheckOpts, translate_check};
 use hashbrown::HashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{AssertSqlSafe, Pool, Sqlite};
@@ -21,6 +22,10 @@ const SYNC_LOG_DDL: &str = "CREATE TABLE IF NOT EXISTS __sync_log__ (\
     updated_at  INTEGER NOT NULL,\
     PRIMARY KEY (table_name, record_id)\
 ) WITHOUT ROWID, STRICT;\n";
+
+const CHECK_OPTS: CheckOpts = CheckOpts {
+    allow_regexp: false,
+};
 
 pub struct SqliteDatabase<'a> {
     pool: Pool<Sqlite>,
@@ -464,6 +469,9 @@ impl<'a> SqliteDatabase<'a> {
     fn write_create_table(sql: &mut String, schema: &DatabaseSchema, table: TableRef<'_>) {
         let _ = write!(sql, "CREATE TABLE IF NOT EXISTS {} (", Ident(table.name()));
 
+        let pk_count = table.columns().filter(|c| c.is_primary_key()).count();
+        let composite_pk = pk_count > 1;
+
         let mut first = true;
         for column in table.columns() {
             if !first {
@@ -479,7 +487,11 @@ impl<'a> SqliteDatabase<'a> {
             );
 
             if column.is_primary_key() {
-                sql.push_str(" PRIMARY KEY NOT NULL");
+                if composite_pk {
+                    sql.push_str(" NOT NULL");
+                } else {
+                    sql.push_str(" PRIMARY KEY NOT NULL");
+                }
             } else {
                 if column.is_unique() {
                     sql.push_str(" UNIQUE");
@@ -497,23 +509,63 @@ impl<'a> SqliteDatabase<'a> {
             }
         }
 
+        if composite_pk {
+            sql.push_str(",PRIMARY KEY(");
+            let mut first_pk = true;
+            for column in table.columns().filter(|c| c.is_primary_key()) {
+                if !first_pk {
+                    sql.push(',');
+                }
+                first_pk = false;
+                let _ = write!(sql, "{}", Ident(column.name()));
+            }
+            sql.push(')');
+        }
+
+        let mut seen: Vec<Symbol> = Vec::new();
         for column in table.columns() {
             for fk in column.foreign_keys() {
+                let name = fk.constraint_name();
+                if seen.contains(&name) {
+                    continue;
+                }
+                seen.push(name);
+
                 let Some(ref_table) = schema.table_at(fk.table_index()) else {
                     continue;
                 };
-                let Some(&ref_col) = ref_table.column_names().get(fk.column_index()) else {
+                let mut locals: Vec<String> = Vec::new();
+                let mut refs: Vec<String> = Vec::new();
+                let mut ok = true;
+
+                for c in table.columns() {
+                    for f in c
+                        .foreign_keys()
+                        .iter()
+                        .filter(|f| f.constraint_name() == name)
+                    {
+                        let ref_col = ref_table
+                            .column_names()
+                            .get(f.column_index())
+                            .and_then(|&s| schema.resolve_symbol(s));
+                        match ref_col {
+                            Some(rc) => {
+                                locals.push(Ident(c.name()).to_string());
+                                refs.push(Ident(rc).to_string());
+                            }
+                            None => ok = false,
+                        }
+                    }
+                }
+                if !ok || locals.is_empty() {
                     continue;
-                };
-                let Some(ref_col) = schema.resolve_symbol(ref_col) else {
-                    continue;
-                };
+                }
                 let _ = write!(
                     sql,
                     ",FOREIGN KEY({}) REFERENCES {}({}) ON UPDATE {} ON DELETE {}",
-                    Ident(column.name()),
+                    locals.join(","),
                     Ident(ref_table.name()),
-                    Ident(ref_col),
+                    refs.join(","),
                     fk.on_update(),
                     fk.on_delete(),
                 );
@@ -521,14 +573,40 @@ impl<'a> SqliteDatabase<'a> {
         }
 
         for column in table.columns() {
-            for &constraint in column.constraints() {
-                if let Some(check) = schema.resolve_symbol(constraint)
-                    && !check.is_empty()
-                    && !check.contains("::")
-                {
-                    sql.push(',');
-                    sql.push_str(check);
-                }
+            let col_ident = Ident(column.name()).to_string();
+
+            let labels: Vec<&str> = column
+                .constraints()
+                .iter()
+                .filter_map(|&s| schema.resolve_symbol(s))
+                .collect();
+            if !labels.is_empty() {
+                let list = labels
+                    .iter()
+                    .map(|l| format!("'{}'", l.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = write!(sql, ",CHECK({col_ident} IN ({list}))");
+            }
+
+            for &sym in column.domain_checks() {
+                Self::push_check(
+                    sql,
+                    schema.resolve_symbol(sym),
+                    Some(&col_ident),
+                    table.name(),
+                    column.name(),
+                );
+            }
+
+            for &sym in column.constraints() {
+                Self::push_check(
+                    sql,
+                    schema.resolve_symbol(sym),
+                    None,
+                    table.name(),
+                    column.name(),
+                );
             }
         }
 
@@ -626,5 +704,24 @@ impl<'a> SqliteDatabase<'a> {
             })?;
 
         Ok(())
+    }
+
+    fn push_check(
+        sql: &mut String,
+        def: Option<&str>,
+        value: Option<&str>,
+        table: &str,
+        col: &str,
+    ) {
+        let Some(def) = def.filter(|d| !d.trim().is_empty()) else {
+            return;
+        };
+        match translate_check(def, value, &CHECK_OPTS) {
+            Some(expr) => {
+                sql.push_str(",CHECK ");
+                sql.push_str(&expr);
+            }
+            None => eprintln!("sqlite: skipping untranslatable CHECK on {table}.{col}: {def}"),
+        }
     }
 }

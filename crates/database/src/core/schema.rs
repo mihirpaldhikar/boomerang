@@ -205,6 +205,8 @@ pub struct Column {
     pub(crate) flags: ColumnFlags,
     pub(crate) constraints: PoolRange,
     pub(crate) foreign_keys: PoolRange,
+    pub(crate) enum_labels: PoolRange,
+    pub(crate) domain_checks: PoolRange,
 }
 
 impl Column {
@@ -318,6 +320,16 @@ impl<'a> ColumnRef<'a> {
     #[inline]
     pub fn foreign_keys(&self) -> &'a [ForeignKey] {
         &self.schema.foreign_key_pool[self.meta().foreign_keys.as_range()]
+    }
+
+    #[inline]
+    pub fn enum_labels(&self) -> &'a [Symbol] {
+        &self.schema.constraint_pool[self.meta().enum_labels.as_range()]
+    }
+
+    #[inline]
+    pub fn domain_checks(&self) -> &'a [Symbol] {
+        &self.schema.constraint_pool[self.meta().domain_checks.as_range()]
     }
 }
 
@@ -511,7 +523,7 @@ impl DatabaseSchema {
             + 4 + self.constraint_pool.len() * 4 // constraint_pool
             + 4 + self.foreign_key_pool.len() * 14; // foreign_keys
 
-        estimated_cap += 4 + self.columns.len() * 32;
+        estimated_cap += 4 + self.columns.len() * 40;
 
         let mut buf = Vec::with_capacity(estimated_cap);
 
@@ -579,6 +591,10 @@ impl DatabaseSchema {
             write_u16!(c.constraints.len);
             write_u32!(c.foreign_keys.start);
             write_u16!(c.foreign_keys.len);
+            write_u32!(c.enum_labels.start);
+            write_u16!(c.enum_labels.len);
+            write_u32!(c.domain_checks.start);
+            write_u16!(c.domain_checks.len);
         }
 
         write_u32!(self.column_names.len());
@@ -722,6 +738,14 @@ impl DatabaseSchema {
                     start: read_u32!(),
                     len: read_u16!(),
                 },
+                enum_labels: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
+                domain_checks: PoolRange {
+                    start: read_u32!(),
+                    len: read_u16!(),
+                },
             });
         }
 
@@ -748,6 +772,15 @@ impl DatabaseSchema {
                 on_update: Action::from(read_u8!()),
                 on_delete: Action::from(read_u8!()),
             });
+        }
+
+        let pool_len = constraint_pool.len();
+        for c in &columns {
+            for r in [c.constraints, c.enum_labels, c.domain_checks] {
+                if r.start as usize + r.len as usize > pool_len {
+                    return None;
+                }
+            }
         }
 
         Some(DatabaseSchema {
@@ -881,6 +914,14 @@ impl DatabaseSchema {
                         len: read_u16!()
                     },
                     foreign_keys: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                    enum_labels: PoolRange {
+                        start: read_u32!(),
+                        len: read_u16!()
+                    },
+                    domain_checks: PoolRange {
                         start: read_u32!(),
                         len: read_u16!()
                     },
