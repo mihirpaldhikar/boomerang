@@ -28,46 +28,19 @@ extern crate self as yamlite;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod error;
 mod parser;
 pub mod simd;
 
 #[cfg(feature = "derive")]
 pub use yamlite_macros::FromYaml;
 
+pub use error::{SourceLocation, YamlError, YamlErrorKind};
+
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::fmt;
-
-pub mod __private {
-    pub use alloc::borrow::Cow;
-    pub use alloc::format;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct YamlError {
-    pub offset: usize,
-    pub message: String,
-}
-
-impl YamlError {
-    pub fn new(offset: usize, msg: impl Into<String>) -> Self {
-        Self {
-            offset,
-            message: msg.into(),
-        }
-    }
-}
-
-impl fmt::Display for YamlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "YAML error at byte {}: {}", self.offset, self.message)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for YamlError {}
 
 #[derive(Debug, Clone)]
 pub enum TapeKind {
@@ -81,6 +54,19 @@ pub enum TapeKind {
     SeqStart { end_idx: u32 },
     SeqEnd,
     Alias { target_idx: u32 },
+}
+
+impl TapeKind {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::PlainStr { .. } | Self::QuotedStr { .. } | Self::OwnedStr(_) => "string/scalar",
+            Self::Tag { .. } => "tag",
+            Self::MapStart { .. } | Self::MapEnd => "mapping",
+            Self::SeqStart { .. } | Self::SeqEnd => "sequence",
+            Self::Alias { .. } => "alias",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,7 +96,7 @@ impl<'t, 'a> TapeCursor<'t, 'a> {
         self.tape
             .nodes
             .get(self.idx)
-            .ok_or_else(|| YamlError::new(self.tape.src.len(), "unexpected end of YAML"))
+            .ok_or_else(|| YamlError::from_kind(self.tape.src.len(), YamlErrorKind::UnexpectedEof))
     }
 
     #[inline]
@@ -204,7 +190,11 @@ impl<'t, 'a> TapeCursor<'t, 'a> {
             return Ok(());
         }
         let n = self.peek()?;
-        Err(YamlError::new(n.offset as usize, "expected null/unit"))
+        Err(YamlError::type_mismatch(
+            n.offset as usize,
+            "null/unit",
+            n.kind.type_name(),
+        ))
     }
 
     pub fn read_cow_str(&mut self) -> Result<Cow<'a, str>, YamlError> {
@@ -219,7 +209,11 @@ impl<'t, 'a> TapeCursor<'t, 'a> {
             }
             TapeKind::OwnedStr(id) => Ok(Cow::Owned(self.tape.owned_strings[id as usize].clone())),
             TapeKind::Null => Ok(Cow::Borrowed("")),
-            _ => Err(YamlError::new(n.offset as usize, "expected string scalar")),
+            _ => Err(YamlError::type_mismatch(
+                n.offset as usize,
+                "string scalar",
+                n.kind.type_name(),
+            )),
         }
     }
 
@@ -238,20 +232,25 @@ impl<'t, 'a> TapeCursor<'t, 'a> {
 
 pub trait FromYaml<'a>: Sized {
     fn from_yaml(input: &'a str) -> Result<Self, YamlError> {
-        let tape = parser::parse_to_tape(input)?;
+        let tape = parser::parse_to_tape(input).map_err(|e| e.with_source(input))?;
         let mut cursor = TapeCursor::new(&tape);
-        Self::from_cursor(&mut cursor)
+        Self::from_cursor(&mut cursor).map_err(|e| e.with_source(input))
     }
 
     fn from_cursor(cursor: &mut TapeCursor<'_, 'a>) -> Result<Self, YamlError>;
 }
 
+#[inline]
+pub fn from_str<'a, T: FromYaml<'a>>(input: &'a str) -> Result<T, YamlError> {
+    T::from_yaml(input)
+}
+
 pub fn from_yaml_stream<'a, T: FromYaml<'a>>(input: &'a str) -> Result<Vec<T>, YamlError> {
-    let tapes = parser::parse_stream_to_tapes(input)?;
+    let tapes = parser::parse_stream_to_tapes(input).map_err(|e| e.with_source(input))?;
     let mut out = Vec::with_capacity(tapes.len());
     for tape in &tapes {
         let mut cursor = TapeCursor::new(tape);
-        out.push(T::from_cursor(&mut cursor)?);
+        out.push(T::from_cursor(&mut cursor).map_err(|e| e.with_source(input))?);
     }
     Ok(out)
 }
@@ -267,11 +266,15 @@ impl<'src: 'out, 'out> FromYaml<'src> for &'out str {
             TapeKind::PlainStr { start, end } | TapeKind::QuotedStr { start, end } => {
                 Ok(&cursor.tape.src[start as usize..end as usize])
             }
-            TapeKind::OwnedStr(_) => Err(YamlError::new(
+            TapeKind::OwnedStr(_) => Err(YamlError::from_kind(
                 n.offset as usize,
-                "cannot borrow `&str` from escaped or block scalar; use `String` or `Cow<str>`",
+                YamlErrorKind::BorrowedEscapedScalar,
             )),
-            _ => Err(YamlError::new(n.offset as usize, "expected `&str` scalar")),
+            _ => Err(YamlError::type_mismatch(
+                n.offset as usize,
+                "`&str` scalar",
+                n.kind.type_name(),
+            )),
         }
     }
 }
@@ -297,16 +300,18 @@ impl<'a> FromYaml<'a> for bool {
         let n = cursor.next_node()?;
         match n.kind {
             TapeKind::PlainStr { start, end } | TapeKind::QuotedStr { start, end } => {
-                match &cursor.tape.src[start as usize..end as usize] {
+                let raw = &cursor.tape.src[start as usize..end as usize];
+                match raw {
                     "true" | "True" | "TRUE" => Ok(true),
                     "false" | "False" | "FALSE" => Ok(false),
-                    other => Err(YamlError::new(
-                        n.offset as usize,
-                        alloc::format!("invalid bool `{other}`"),
-                    )),
+                    _ => Err(YamlError::invalid_value(n.offset as usize, "bool", raw)),
                 }
             }
-            _ => Err(YamlError::new(n.offset as usize, "expected bool")),
+            _ => Err(YamlError::type_mismatch(
+                n.offset as usize,
+                "bool",
+                n.kind.type_name(),
+            )),
         }
     }
 }
@@ -329,7 +334,7 @@ macro_rules! impl_int {
                     } else {
                         s.parse::<$t>()
                     };
-                    res.map_err(|_| YamlError::new(offset, alloc::format!("invalid integer `{s}`")))
+                    res.map_err(|_| YamlError::invalid_value(offset, stringify!($t), s.into_owned()))
                 }
             }
         )*
@@ -356,7 +361,7 @@ macro_rules! impl_float {
                         ".nan" | ".NaN" | ".NAN" => Ok(<$t>::NAN),
                         _ => s
                             .parse::<$t>()
-                            .map_err(|_| YamlError::new(offset, alloc::format!("invalid float `{s}`"))),
+                            .map_err(|_| YamlError::invalid_value(offset, stringify!($t), s.into_owned())),
                     }
                 }
             }
@@ -393,7 +398,13 @@ impl<'a, T: FromYaml<'a>> FromYaml<'a> for Vec<T> {
         let start = cursor.next_node()?;
         let end_idx = match start.kind {
             TapeKind::SeqStart { end_idx } => end_idx as usize,
-            _ => return Err(YamlError::new(start.offset as usize, "expected sequence")),
+            _ => {
+                return Err(YamlError::type_mismatch(
+                    start.offset as usize,
+                    "sequence",
+                    start.kind.type_name(),
+                ));
+            }
         };
         let mut out = Vec::new();
         while cursor.idx + 1 < end_idx {
@@ -421,7 +432,13 @@ where
         let start = cursor.next_node()?;
         let end_idx = match start.kind {
             TapeKind::MapStart { end_idx } => end_idx as usize,
-            _ => return Err(YamlError::new(start.offset as usize, "expected mapping")),
+            _ => {
+                return Err(YamlError::type_mismatch(
+                    start.offset as usize,
+                    "mapping",
+                    start.kind.type_name(),
+                ));
+            }
         };
         let mut map = BTreeMap::new();
         while cursor.idx + 1 < end_idx {

@@ -24,8 +24,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::simd;
 use crate::{Tape, TapeKind, TapeNode, YamlError};
+use crate::{YamlErrorKind, simd};
 
 const MAX_DEPTH: usize = 128;
 
@@ -118,9 +118,9 @@ impl<'a> Parser<'a> {
     fn enter_depth(&mut self) -> Result<(), YamlError> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
-            return Err(YamlError::new(
+            return Err(YamlError::from_kind(
                 self.pos,
-                "maximum YAML nesting depth exceeded",
+                YamlErrorKind::MaxDepthExceeded(MAX_DEPTH),
             ));
         }
         Ok(())
@@ -278,7 +278,6 @@ impl<'a> Parser<'a> {
                         return Err(YamlError::new(start, "empty anchor name"));
                     }
                     anchor = Some(&self.src[start..self.pos]);
-                    self.skip_ws_and_comments();
                 }
                 b'!' => {
                     let start = self.pos;
@@ -298,19 +297,11 @@ impl<'a> Parser<'a> {
                         },
                         offset: start as u32,
                     });
-                    self.skip_ws_and_comments();
                 }
                 _ => break,
             }
         }
         Ok(anchor)
-    }
-
-    fn parse_block_node(&mut self, parent_indent: isize) -> Result<(), YamlError> {
-        self.enter_depth()?;
-        let res = self.parse_block_node_inner(parent_indent);
-        self.exit_depth();
-        res
     }
 
     fn parse_block_node_inner(&mut self, parent_indent: isize) -> Result<(), YamlError> {
@@ -327,6 +318,25 @@ impl<'a> Parser<'a> {
         let value_start_idx = self.nodes.len() as u32;
         if let Some(name) = anchor {
             self.anchors.insert(name, value_start_idx);
+        }
+
+        if self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b'\n' | b'\r' | b'#') {
+            self.skip_ws_and_comments();
+            if self.pos >= self.bytes.len() || self.is_doc_boundary() {
+                self.nodes.push(TapeNode {
+                    kind: TapeKind::Null,
+                    offset: self.pos as u32,
+                });
+                return Ok(());
+            }
+            let next_indent = self.line_indent_at(self.pos) as isize;
+            if next_indent <= parent_indent && !self.is_seq_dash_at(self.pos) {
+                self.nodes.push(TapeNode {
+                    kind: TapeKind::Null,
+                    offset: self.pos as u32,
+                });
+                return Ok(());
+            }
         }
 
         if self.pos >= self.bytes.len() || self.is_doc_boundary() {
@@ -346,6 +356,13 @@ impl<'a> Parser<'a> {
             _ if self.looks_like_block_map_entry() => self.parse_block_map(self.current_column()),
             _ => self.parse_plain_or_quoted_scalar(false),
         }
+    }
+
+    fn parse_block_node(&mut self, parent_indent: isize) -> Result<(), YamlError> {
+        self.enter_depth()?;
+        let res = self.parse_block_node_inner(parent_indent);
+        self.exit_depth();
+        res
     }
 
     #[inline]
@@ -370,10 +387,9 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let name = &self.src[start..self.pos];
-        let target_idx = *self
-            .anchors
-            .get(name)
-            .ok_or_else(|| YamlError::new(offset, alloc::format!("unknown alias `*{name}`")))?;
+        let target_idx = *self.anchors.get(name).ok_or_else(|| {
+            YamlError::from_kind(offset, YamlErrorKind::UnknownAlias(String::from(name)))
+        })?;
         self.nodes.push(TapeNode {
             kind: TapeKind::Alias { target_idx },
             offset: offset as u32,
@@ -514,22 +530,26 @@ impl<'a> Parser<'a> {
     fn collect_merge_targets(&mut self, out: &mut Vec<u32>) -> Result<(), YamlError> {
         let resolve_one = |this: &mut Self| -> Result<u32, YamlError> {
             this.skip_horiz_ws();
+            let offset = this.pos;
             if this.bytes.get(this.pos) != Some(&b'*') {
-                return Err(YamlError::new(this.pos, "`<<` merge expects `*alias`"));
+                return Err(YamlError::new(offset, "`<<` merge expects `*alias`"));
             }
             this.pos += 1;
             let start = this.pos;
             while this.pos < this.bytes.len()
                 && !matches!(
                     this.bytes[this.pos],
-                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b']'
+                    b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}'
                 )
             {
                 this.pos += 1;
             }
+            if start == this.pos {
+                return Err(YamlError::new(offset, "empty merge alias"));
+            }
             let name = &this.src[start..this.pos];
             this.anchors.get(name).copied().ok_or_else(|| {
-                YamlError::new(start, alloc::format!("unknown merge alias `*{name}`"))
+                YamlError::from_kind(offset, YamlErrorKind::UnknownAlias(String::from(name)))
             })
         };
 
@@ -781,6 +801,7 @@ impl<'a> Parser<'a> {
 
     fn parse_flow_node(&mut self) -> Result<(), YamlError> {
         let anchor = self.parse_node_properties()?;
+        self.skip_ws_and_comments();
         let idx = self.nodes.len() as u32;
         if let Some(name) = anchor {
             self.anchors.insert(name, idx);

@@ -194,6 +194,14 @@ fn expand_from_yaml(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     };
 
+    let inherent_impl = build_inherent_impl(
+        name,
+        &input.generics,
+        &existing_lts,
+        &trait_lt,
+        &ty_generics,
+    );
+
     Ok(quote! {
         impl #impl_generics ::yamlite::FromYaml<#trait_lt> for #name #ty_generics #where_clause {
             fn from_cursor(
@@ -205,7 +213,72 @@ fn expand_from_yaml(input: DeriveInput) -> syn::Result<TokenStream2> {
                 #body
             }
         }
+
+        #inherent_impl
     })
+}
+
+fn build_inherent_impl(
+    name: &Ident,
+    generics: &syn::Generics,
+    existing_lts: &[Lifetime],
+    trait_lt: &Lifetime,
+    ty_generics: &TokenStream2,
+) -> TokenStream2 {
+    let mut orig_impl_gens = generics.clone();
+    orig_impl_gens.params = orig_impl_gens
+        .params
+        .into_iter()
+        .map(|mut p| {
+            if let GenericParam::Type(ref mut tp) = p {
+                tp.default = None;
+            }
+            p
+        })
+        .collect();
+    let (_, _, orig_where) = generics.split_for_impl();
+
+    let tp_bounds: Vec<WherePredicate> = generics
+        .type_params()
+        .map(|tp| {
+            let id = &tp.ident;
+            syn::parse_quote!(#id: ::yamlite::FromYaml<#trait_lt>)
+        })
+        .collect();
+
+    let method_where = if tp_bounds.is_empty() {
+        quote!()
+    } else {
+        quote!(where #(#tp_bounds),*)
+    };
+
+    if existing_lts.len() == 1 {
+        quote! {
+            impl #orig_impl_gens #name #ty_generics #orig_where {
+                #[inline]
+                pub fn from_yaml(
+                    input: &#trait_lt str,
+                ) -> ::core::result::Result<Self, ::yamlite::YamlError> #method_where {
+                    <Self as ::yamlite::FromYaml<#trait_lt>>::from_yaml(input)
+                }
+            }
+        }
+    } else {
+        let mut lt_param = LifetimeParam::new(trait_lt.clone());
+        for existing in existing_lts {
+            lt_param.bounds.push(existing.clone());
+        }
+        quote! {
+            impl #orig_impl_gens #name #ty_generics #orig_where {
+                #[inline]
+                pub fn from_yaml<#lt_param>(
+                    input: &#trait_lt str,
+                ) -> ::core::result::Result<Self, ::yamlite::YamlError> #method_where {
+                    <Self as ::yamlite::FromYaml<#trait_lt>>::from_yaml(input)
+                }
+            }
+        }
+    }
 }
 
 fn build_generics(
@@ -317,7 +390,11 @@ fn expand_struct(
                 let __end_idx = match __start.kind {
                     ::yamlite::TapeKind::SeqStart { end_idx } => end_idx as usize,
                     _ => return ::core::result::Result::Err(
-                        ::yamlite::YamlError::new(__start_offset, "expected YAML sequence for tuple struct")
+                        ::yamlite::YamlError::type_mismatch(
+                            __start_offset,
+                            "sequence",
+                            __start.kind.type_name(),
+                        )
                     ),
                 };
                 let __val = Self(#(#elems),*);
@@ -401,10 +478,7 @@ fn expand_named_fields<'a>(
                 all_defaultable = false;
                 field_assigns.push(quote! {
                     #ident: #var.ok_or_else(|| {
-                        ::yamlite::YamlError::new(
-                            __start_offset,
-                            ::yamlite::__private::format!("missing required field `{}`", #primary_key)
-                        )
+                        ::yamlite::YamlError::missing_field(__start_offset, #primary_key)
                     })?
                 });
             }
@@ -432,7 +506,7 @@ fn expand_named_fields<'a>(
             quote!(let __key_offset = __yaml_cursor.peek()?.offset as usize;),
             quote! {
                 __other => return ::core::result::Result::Err(
-                    ::yamlite::YamlError::new(__key_offset, ::yamlite::__private::format!("unknown field `{__other}`"))
+                    ::yamlite::YamlError::unknown_field(__key_offset, __other)
                 ),
             },
         )
@@ -453,7 +527,11 @@ fn expand_named_fields<'a>(
             ::yamlite::TapeKind::MapStart { end_idx } => end_idx as usize,
             #null_arm
             _ => return ::core::result::Result::Err(
-                ::yamlite::YamlError::new(__start_offset, "expected YAML mapping")
+                ::yamlite::YamlError::type_mismatch(
+                    __start_offset,
+                    "mapping",
+                    __start.kind.type_name(),
+                )
             ),
         };
 
@@ -532,7 +610,11 @@ fn expand_enum(
                     let __end = match __s.kind {
                         ::yamlite::TapeKind::SeqStart { end_idx } => end_idx as usize,
                         _ => return ::core::result::Result::Err(
-                            ::yamlite::YamlError::new(__s.offset as usize, "expected sequence for tuple variant")
+                            ::yamlite::YamlError::type_mismatch(
+                                __s.offset as usize,
+                                "sequence",
+                                __s.kind.type_name(),
+                            )
                         ),
                     };
                     let __res = Self::#v_ident(#(#elems),*);
@@ -563,13 +645,11 @@ fn expand_enum(
 
     Ok(quote! {
         if let ::core::option::Option::Some(__tag) = __yaml_cursor.take_tag() {
+            let __tag_off = __yaml_cursor.peek().map(|n| n.offset as usize).unwrap_or(0);
             return match __tag {
                 #(#tag_arms)*
                 __other => ::core::result::Result::Err(
-                    ::yamlite::YamlError::new(
-                        __yaml_cursor.peek().map(|n| n.offset as usize).unwrap_or(0),
-                        ::yamlite::__private::format!("unknown enum tag `{__other}` for `{}`", stringify!(#enum_name))
-                    )
+                    ::yamlite::YamlError::unknown_variant(__tag_off, __other)
                 ),
             };
         }
@@ -586,11 +666,12 @@ fn expand_enum(
                     ::yamlite::YamlError::new(__off, "empty mapping for enum")
                 );
             }
+            let __variant_off = __yaml_cursor.peek()?.offset as usize;
             let __variant_key = __yaml_cursor.read_cow_str()?;
             let __val = match __variant_key.as_ref() {
                 #(#map_arms)*
                 __other => return ::core::result::Result::Err(
-                    ::yamlite::YamlError::new(__off, ::yamlite::__private::format!("unknown variant `{__other}`"))
+                    ::yamlite::YamlError::unknown_variant(__variant_off, __other)
                 ),
             }?;
             if __yaml_cursor.idx + 1 != __end_idx {
@@ -607,7 +688,7 @@ fn expand_enum(
         match __s.as_ref() {
             #(#unit_arms)*
             __other => ::core::result::Result::Err(
-                ::yamlite::YamlError::new(__off, ::yamlite::__private::format!("unknown variant `{__other}`"))
+                ::yamlite::YamlError::unknown_variant(__off, __other)
             ),
         }
     })
@@ -664,24 +745,26 @@ fn expand_internally_tagged_enum(
         let __end_idx = match __start.kind {
             ::yamlite::TapeKind::MapStart { end_idx } => end_idx as usize,
             _ => return ::core::result::Result::Err(
-                ::yamlite::YamlError::new(__off, "expected YAML mapping for internally tagged enum")
+                ::yamlite::YamlError::type_mismatch(__off, "mapping", __start.kind.type_name())
             ),
         };
 
-        let mut __found_tag: ::core::option::Option<::yamlite::__private::Cow<#trait_lt, str>> = ::core::option::Option::None;
+        let mut __found_tag: ::core::option::Option<(usize, ::yamlite::__private::Cow<#trait_lt, str>)> =
+            ::core::option::Option::None;
         while __yaml_cursor.idx + 1 < __end_idx {
             let __k = __yaml_cursor.read_cow_str()?;
             if __k.as_ref() == #tag_key {
-                __found_tag = ::core::option::Option::Some(__yaml_cursor.read_cow_str()?);
+                let __val_off = __yaml_cursor.peek()?.offset as usize;
+                __found_tag = ::core::option::Option::Some((__val_off, __yaml_cursor.read_cow_str()?));
                 break;
             }
             __yaml_cursor.skip_value()?;
         }
 
-        let __tag_val = __found_tag.ok_or_else(|| {
-            ::yamlite::YamlError::new(
+        let (__tag_off, __tag_val) = __found_tag.ok_or_else(|| {
+            ::yamlite::YamlError::missing_field(
                 __off,
-                ::yamlite::__private::format!("missing tag field `{}` on `{}`", #tag_key, stringify!(#enum_name))
+                ::yamlite::__private::format!("{} (for `{}`)", #tag_key, stringify!(#enum_name)),
             )
         })?;
 
@@ -689,7 +772,7 @@ fn expand_internally_tagged_enum(
         match __tag_val.as_ref() {
             #(#arms)*
             __other => ::core::result::Result::Err(
-                ::yamlite::YamlError::new(__off, ::yamlite::__private::format!("unknown tag value `{__other}`"))
+                ::yamlite::YamlError::unknown_variant(__tag_off, __other)
             ),
         }
     })

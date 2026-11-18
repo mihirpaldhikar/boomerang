@@ -22,7 +22,6 @@
 use crate::cli::{Cli, Commands};
 use crate::config::BoomerangConfig;
 use clap::{CommandFactory, Parser};
-use yamlite::FromYaml;
 
 mod cli;
 mod config;
@@ -61,7 +60,7 @@ async fn main() {
     let cfg = match BoomerangConfig::from_yaml(&config_file) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("config error: {}", e.message);
+            eprintln!("config error: {}", e.to_string());
             std::process::exit(1);
         }
     };

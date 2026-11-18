@@ -11,3 +11,4 @@ derive = ["dep:yamlite_macros"]
 
 [dependencies]
 yamlite_macros = { path = "macros", optional = true }
+thiserror.workspace = true
