@@ -24,10 +24,16 @@ use yamlite::FromYaml;
 
 #[derive(Debug, PartialEq, FromYaml)]
 pub(crate) struct BoomerangConfig<'a> {
+    pub(crate) server: Server,
     pub(crate) database: Database<'a>,
 }
 
 #[derive(Debug, PartialEq, FromYaml)]
 pub(crate) struct Database<'a> {
     pub(crate) url: &'a str,
+}
+
+#[derive(Debug, PartialEq, FromYaml)]
+pub(crate) struct Server {
+    pub(crate) port: u16,
 }

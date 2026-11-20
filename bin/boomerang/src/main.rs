@@ -22,9 +22,11 @@
 use crate::cli::{Cli, Commands};
 use crate::config::BoomerangConfig;
 use clap::{CommandFactory, Parser};
+use http::HttpServer;
 
 mod cli;
 mod config;
+mod routes;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -75,7 +77,16 @@ async fn main() {
 
     match cli.command {
         Commands::Start => {
-            println!("Hello from boomerang!")
+            let http_server = match HttpServer::builder(cfg.server.port).build().await {
+                Ok(srv) => srv,
+                Err(e) => {
+                    eprintln!("server error: {}", e.to_string());
+                    std::process::exit(1);
+                }
+            };
+
+            let (_, listener) = http_server.listen();
+            listener.await
         }
         Commands::Prune => {
             if let Err(e) = pg.remove_setup().await {
