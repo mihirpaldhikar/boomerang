@@ -12,7 +12,6 @@ derive = ["dep:http_macros"]
 http_macros = { path = "macros", optional = true }
 
 hashbrown.workspace = true
-futures.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 socket2.workspace = true
