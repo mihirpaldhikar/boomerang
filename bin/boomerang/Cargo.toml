@@ -12,5 +12,6 @@ path = "src/main.rs"
 mimalloc.workspace = true
 tokio.workspace = true
 database.workspace = true
+http.workspace = true
 yamlite.workspace = true
 clap.workspace = true
