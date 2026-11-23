@@ -973,10 +973,10 @@ impl AcmeClient {
     }
 }
 
-fn pick_challenge<'a>(
-    challenges: &'a [JsonValue],
+fn pick_challenge(
+    challenges: &[JsonValue],
     mode: AcmeChallengeMode,
-) -> Option<&'a JsonValue> {
+) -> Option<&JsonValue> {
     let find_type = |t: &str| challenges.iter().find(|c| c["type"].as_str() == Some(t));
     match mode {
         AcmeChallengeMode::TlsAlpn01 => find_type("tls-alpn-01"),
@@ -1012,9 +1012,12 @@ fn build_tls_alpn_cert(domain: &str, sha_digest: &[u8]) -> Result<Arc<CertifiedK
         .map_err(|e| format!("TLS-ALPN self-sign error: {e}"))?;
 
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
-    let ck = build_certified_key(vec![cert.der().clone()], key_der)
-        .map_err(|e| format!("TLS-ALPN CertifiedKey error: {e}"))?;
-    Ok(Arc::new(ck))
+    let signer = rustls::crypto::aws_lc_rs::default_provider()
+        .key_provider
+        .load_private_key(key_der)
+        .map_err(|e| format!("TLS-ALPN key load error: {e}"))?;
+
+    Ok(Arc::new(CertifiedKey::new(vec![cert.der().clone()], signer)))
 }
 
 pub(crate) async fn run_acme_loop(
