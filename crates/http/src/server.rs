@@ -711,6 +711,7 @@ impl HttpServer {
                         // Pin OS thread BEFORE creating LocalRuntime so any spawn_blocking
                         // threads won't inherit pinning onto this hot I/O core.
                         pin_current_thread_to_cpu(cpu_id);
+                        init_worker_request_id_gen(idx);
 
                         let rt = build_worker_local_runtime();
                         rt.block_on(async move {
@@ -742,24 +743,25 @@ impl HttpServer {
 
                                                     tokio::task::spawn_local(async move {
                                                         let _guard = LocalTaskGuard::new();
-                                                        let mut req_rng = FastUuidGen::new();
 
                                                         let transport = match &srv.tls {
-                                                            None => Transport::from_tcp(stream, peer_addr),
+                                                            None => Transport::from_tcp(
+                                                                stream, peer_addr,
+                                                            ),
                                                             Some(acceptor) => {
-                                                                match acceptor.accept(stream).await {
-                                                                    Ok(tls_stream) => Transport::from_tls(tls_stream, peer_addr),
+                                                                match acceptor.accept(stream).await
+                                                                {
+                                                                    Ok(tls_stream) => {
+                                                                        Transport::from_tls(
+                                                                            tls_stream, peer_addr,
+                                                                        )
+                                                                    }
                                                                     Err(_) => return,
                                                                 }
                                                             }
                                                         };
 
-                                                        srv.handle_connection(
-                                                            transport,
-                                                            &rh,
-                                                            &mut req_rng,
-                                                        )
-                                                        .await;
+                                                        srv.handle_connection(transport, &rh).await;
                                                     });
 
                                                     accepted += 1;

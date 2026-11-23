@@ -28,6 +28,9 @@ use socket2::Socket;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use crate::server::prewarm_linux_fd_table;
+
 pub struct HttpServerBuilder {
     port: u16,
     cors: Option<Cors>,
