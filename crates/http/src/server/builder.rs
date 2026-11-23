@@ -25,7 +25,7 @@ use crate::server::request_info::RequestInfo;
 use crate::server::{ActiveSet, HttpServer, HttpServerError, OnRequestComplete};
 use crate::tls::{AcmeChallengeStore, TlsConfig};
 use socket2::Socket;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
 
 pub struct HttpServerBuilder {
@@ -117,13 +117,6 @@ impl HttpServerBuilder {
         #[cfg(target_os = "linux")]
         prewarm_linux_fd_table();
 
-        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
-        let domain = if addr.is_ipv6() {
-            socket2::Domain::IPV6
-        } else {
-            socket2::Domain::IPV4
-        };
-
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -134,47 +127,8 @@ impl HttpServerBuilder {
         let listener_count = 1;
 
         let mut listeners = Vec::with_capacity(listener_count);
-
         for _ in 0..listener_count {
-            let socket = Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-
-            #[cfg(not(windows))]
-            socket.set_reuse_address(true).unwrap_or(());
-            #[cfg(target_os = "linux")]
-            socket.set_reuse_port(true).unwrap_or(());
-
-            socket
-                .bind(&addr.into())
-                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-            socket
-                .listen(4096)
-                .map_err(|_| HttpServerError::AddrInUse(self.port))?;
-            socket.set_nonblocking(true).unwrap_or(());
-            socket.set_tcp_nodelay(true).unwrap_or(());
-            socket
-                .set_tcp_keepalive(
-                    &socket2::TcpKeepalive::new()
-                        .with_time(std::time::Duration::from_secs(60))
-                        .with_interval(std::time::Duration::from_secs(10)),
-                )
-                .unwrap_or(());
-
-            #[cfg(target_os = "linux")]
-            unsafe {
-                use std::os::unix::io::AsRawFd;
-                let defer_secs: libc::c_int = 1;
-                libc::setsockopt(
-                    socket.as_raw_fd(),
-                    libc::IPPROTO_TCP,
-                    libc::TCP_DEFER_ACCEPT,
-                    &defer_secs as *const libc::c_int as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-
-            let std_listener: TcpListener = socket.into();
-            listeners.push(std_listener);
+            listeners.push(bind_dual_stack_socket(self.port, 4096, true)?);
         }
 
         let keep_alive_header: Arc<[u8]> = Arc::from(
@@ -199,26 +153,8 @@ impl HttpServerBuilder {
         };
 
         let acme_http_listener = match self.acme_http_port {
-            Some(port) => {
-                let http_addr = SocketAddr::from(([0, 0, 0, 0], port));
-                let sock = Socket::new(
-                    socket2::Domain::IPV4,
-                    socket2::Type::STREAM,
-                    Some(socket2::Protocol::TCP),
-                )
-                .map_err(|_| HttpServerError::AddrInUse(port))?;
-                #[cfg(not(windows))]
-                sock.set_reuse_address(true).unwrap_or(());
-                #[cfg(target_os = "linux")]
-                sock.set_reuse_port(true).unwrap_or(());
-                sock.bind(&http_addr.into())
-                    .map_err(|_| HttpServerError::AddrInUse(port))?;
-                sock.listen(1024)
-                    .map_err(|_| HttpServerError::AddrInUse(port))?;
-                sock.set_nonblocking(true).unwrap_or(());
-                Some(sock.into())
-            }
-            None => None,
+            Some(port) if port != self.port => Some(bind_dual_stack_socket(port, 1024, false)?),
+            _ => None,
         };
 
         Ok(HttpServer {
@@ -241,4 +177,68 @@ impl HttpServerBuilder {
             acme_webroot: self.acme_webroot,
         })
     }
+}
+
+fn bind_dual_stack_socket(
+    port: u16,
+    backlog: i32,
+    main_listener: bool,
+) -> Result<TcpListener, HttpServerError> {
+    let (socket, addr): (Socket, SocketAddr) = match Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    ) {
+        Ok(sock) if sock.set_only_v6(false).is_ok() => {
+            (sock, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)))
+        }
+        _ => {
+            let sock = Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .map_err(|_| HttpServerError::AddrInUse(port))?;
+            (sock, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+        }
+    };
+
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true).unwrap_or(());
+    #[cfg(target_os = "linux")]
+    socket.set_reuse_port(true).unwrap_or(());
+
+    socket
+        .bind(&addr.into())
+        .map_err(|_| HttpServerError::AddrInUse(port))?;
+    socket
+        .listen(backlog)
+        .map_err(|_| HttpServerError::AddrInUse(port))?;
+    socket.set_nonblocking(true).unwrap_or(());
+    socket.set_tcp_nodelay(true).unwrap_or(());
+
+    if main_listener {
+        socket
+            .set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(60))
+                    .with_interval(std::time::Duration::from_secs(10)),
+            )
+            .unwrap_or(());
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::io::AsRawFd;
+            let defer_secs: libc::c_int = 1;
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_DEFER_ACCEPT,
+                &defer_secs as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    Ok(socket.into())
 }

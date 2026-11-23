@@ -1404,7 +1404,11 @@ impl HttpServer {
             && path.starts_with('/')
             && !path.bytes().any(|b| b == b'\r' || b == b'\n')
         {
-            let host_only = h.split(':').next().unwrap_or(h);
+            let host_only = if h.starts_with('[') {
+                h.find(']').map(|end| &h[..=end]).unwrap_or(h)
+            } else {
+                h.split(':').next().unwrap_or(h)
+            };
             let resp = format!(
                 "HTTP/1.1 301 Moved Permanently\r\nLocation: https://{host_only}{path}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             );

@@ -221,7 +221,7 @@ impl AcmeHttpClient {
     ) -> Result<AcmeHttpResponse, String> {
         let (host, port, path) = parse_https_url(url)?;
 
-        let tcp = TcpStream::connect((host, port))
+        let tcp = connect_dual_stack(host, port)
             .await
             .map_err(|e| format!("ACME connect to {host}:{port} failed: {e}"))?;
         let server_name = ServerName::try_from(host.to_owned())
@@ -237,7 +237,13 @@ impl AcmeHttpClient {
         req.push(' ');
         req.push_str(path);
         req.push_str(" HTTP/1.1\r\nHost: ");
-        req.push_str(host);
+        if host.contains(':') {
+            req.push('[');
+            req.push_str(host);
+            req.push(']');
+        } else {
+            req.push_str(host);
+        }
         if port != 443 {
             use std::fmt::Write;
             let _ = write!(req, ":{port}");
@@ -266,16 +272,197 @@ impl AcmeHttpClient {
             .await
             .map_err(|e| format!("ACME flush failed: {e}"))?;
 
-        let mut raw = Vec::with_capacity(4096);
+        let is_head = method.eq_ignore_ascii_case("HEAD");
+
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            tls.read_to_end(&mut raw),
+            read_http_framed(&mut tls, is_head),
         )
         .await
         .map_err(|_| "ACME HTTP read timed out".to_string())?
-        .map_err(|e| format!("ACME HTTP read failed: {e}"))?;
+    }
+}
 
-        parse_http_response(&raw)
+async fn connect_dual_stack(host: &str, port: u16) -> Result<TcpStream, String> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS lookup failed for {host}:{port}: {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(format!("no addresses resolved for {host}:{port}"));
+    }
+
+    let mut last_err = String::new();
+    for addr in addrs {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(addr))
+            .await
+        {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = format!("{addr}: {e}"),
+            Err(_) => last_err = format!("{addr}: connect timed out"),
+        }
+    }
+
+    Err(format!("ACME connect to {host}:{port} failed ({last_err})"))
+}
+
+async fn read_http_framed<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+    is_head: bool,
+) -> Result<AcmeHttpResponse, String> {
+    let mut raw = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 4096];
+
+    let mut hdr_end_opt: Option<usize> = None;
+    let mut status = 0u16;
+    let mut replay_nonce = None;
+    let mut location = None;
+    let mut is_chunked = false;
+    let mut content_length: Option<usize> = None;
+
+    loop {
+        if hdr_end_opt.is_none() {
+            if let Some(pos) = memchr::memmem::find(&raw, b"\r\n\r\n") {
+                let hdr_str = std::str::from_utf8(&raw[..pos])
+                    .map_err(|_| "ACME response headers not UTF-8".to_string())?;
+                let mut lines = hdr_str.split("\r\n");
+                let status_line = lines.next().ok_or("missing status line")?;
+                status = status_line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .ok_or_else(|| format!("invalid ACME status line: {status_line}"))?;
+
+                for line in lines {
+                    if let Some((k, v)) = line.split_once(':') {
+                        let key = k.trim();
+                        let val = v.trim();
+                        if key.eq_ignore_ascii_case("replay-nonce") {
+                            replay_nonce = Some(val.to_owned());
+                        } else if key.eq_ignore_ascii_case("location") {
+                            location = Some(val.to_owned());
+                        } else if key.eq_ignore_ascii_case("transfer-encoding")
+                            && val.to_ascii_lowercase().contains("chunked")
+                        {
+                            is_chunked = true;
+                        } else if key.eq_ignore_ascii_case("content-length") {
+                            content_length = val.parse::<usize>().ok();
+                        }
+                    }
+                }
+
+                hdr_end_opt = Some(pos + 4);
+            }
+        }
+
+        if let Some(body_start) = hdr_end_opt {
+            if is_head || matches!(status, 204 | 304) || (100..200).contains(&status) {
+                return Ok(AcmeHttpResponse {
+                    status,
+                    replay_nonce,
+                    location,
+                    body: Vec::new(),
+                });
+            }
+
+            let body_slice = &raw[body_start..];
+            if is_chunked {
+                match try_decode_chunked(body_slice) {
+                    ChunkedStatus::Complete(body) => {
+                        return Ok(AcmeHttpResponse {
+                            status,
+                            replay_nonce,
+                            location,
+                            body,
+                        });
+                    }
+                    ChunkedStatus::Malformed(msg) => return Err(msg.to_string()),
+                    ChunkedStatus::Incomplete => {}
+                }
+            } else if let Some(cl) = content_length {
+                if body_slice.len() >= cl {
+                    return Ok(AcmeHttpResponse {
+                        status,
+                        replay_nonce,
+                        location,
+                        body: body_slice[..cl].to_vec(),
+                    });
+                }
+            }
+        }
+
+        match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    && hdr_end_opt.is_some()
+                    && !is_chunked
+                    && content_length.is_none() =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("ACME HTTP read failed: {e}")),
+        }
+    }
+
+    let body_start = hdr_end_opt.ok_or("ACME response closed before headers")?;
+    let body_slice = &raw[body_start..];
+    if is_chunked {
+        return Err("truncated chunked ACME response".into());
+    }
+    if let Some(cl) = content_length {
+        if body_slice.len() < cl {
+            return Err("truncated Content-Length ACME response".into());
+        }
+        return Ok(AcmeHttpResponse {
+            status,
+            replay_nonce,
+            location,
+            body: body_slice[..cl].to_vec(),
+        });
+    }
+
+    Ok(AcmeHttpResponse {
+        status,
+        replay_nonce,
+        location,
+        body: body_slice.to_vec(),
+    })
+}
+
+enum ChunkedStatus {
+    Complete(Vec<u8>),
+    Incomplete,
+    Malformed(&'static str),
+}
+
+fn try_decode_chunked(mut data: &[u8]) -> ChunkedStatus {
+    let mut out = Vec::new();
+    loop {
+        let Some(pos) = memchr::memmem::find(data, b"\r\n") else {
+            return ChunkedStatus::Incomplete;
+        };
+        let Ok(size_line) = std::str::from_utf8(&data[..pos]) else {
+            return ChunkedStatus::Malformed("invalid chunk size UTF-8");
+        };
+        let hex = size_line.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(hex, 16) else {
+            return ChunkedStatus::Malformed("invalid hex chunk size");
+        };
+        data = &data[pos + 2..];
+        if size == 0 {
+            if data.len() < 2 {
+                return ChunkedStatus::Incomplete;
+            }
+            return ChunkedStatus::Complete(out);
+        }
+        if data.len() < size + 2 {
+            return ChunkedStatus::Incomplete;
+        }
+        out.extend_from_slice(&data[..size]);
+        data = &data[size + 2..];
     }
 }
 
@@ -287,89 +474,29 @@ fn parse_https_url(url: &str) -> Result<(&str, u16, &str), String> {
         Some(idx) => (&rest[..idx], &rest[idx..]),
         None => (rest, "/"),
     };
+
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, tail) = after_bracket
+            .split_once(']')
+            .ok_or_else(|| format!("invalid IPv6 host in URL: {url}"))?;
+        let port = if tail.is_empty() {
+            443
+        } else if let Some(p) = tail.strip_prefix(':') {
+            p.parse::<u16>()
+                .map_err(|_| format!("invalid port in URL: {url}"))?
+        } else {
+            return Err(format!("invalid authority in URL: {url}"));
+        };
+        return Ok((host, port, path));
+    }
+
     if let Some((host, port_str)) = authority.rsplit_once(':') {
-        if !host.contains(']') || authority.ends_with(']') {
-            let port = port_str
-                .parse::<u16>()
-                .map_err(|_| format!("invalid port in URL: {url}"))?;
-            return Ok((host.trim_matches(|c| c == '[' || c == ']'), port, path));
-        }
+        let port = port_str
+            .parse::<u16>()
+            .map_err(|_| format!("invalid port in URL: {url}"))?;
+        return Ok((host, port, path));
     }
-    Ok((authority.trim_matches(|c| c == '[' || c == ']'), 443, path))
-}
-
-fn parse_http_response(raw: &[u8]) -> Result<AcmeHttpResponse, String> {
-    let hdr_end = memchr::memmem::find(raw, b"\r\n\r\n")
-        .ok_or_else(|| "ACME response missing header terminator".to_string())?;
-    let hdr_str = std::str::from_utf8(&raw[..hdr_end])
-        .map_err(|_| "ACME response headers not UTF-8".to_string())?;
-    let mut lines = hdr_str.split("\r\n");
-    let status_line = lines.next().ok_or("missing status line")?;
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or_else(|| format!("invalid ACME status line: {status_line}"))?;
-
-    let mut replay_nonce = None;
-    let mut location = None;
-    let mut is_chunked = false;
-    let mut content_length: Option<usize> = None;
-
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("replay-nonce") {
-                replay_nonce = Some(val.to_owned());
-            } else if key.eq_ignore_ascii_case("location") {
-                location = Some(val.to_owned());
-            } else if key.eq_ignore_ascii_case("transfer-encoding")
-                && val.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
-            } else if key.eq_ignore_ascii_case("content-length") {
-                content_length = val.parse::<usize>().ok();
-            }
-        }
-    }
-
-    let raw_body = &raw[hdr_end + 4..];
-    let body = if is_chunked {
-        decode_chunked(raw_body)?
-    } else if let Some(cl) = content_length {
-        raw_body[..cl.min(raw_body.len())].to_vec()
-    } else {
-        raw_body.to_vec()
-    };
-
-    Ok(AcmeHttpResponse {
-        status,
-        replay_nonce,
-        location,
-        body,
-    })
-}
-
-fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    loop {
-        let pos = memchr::memmem::find(data, b"\r\n")
-            .ok_or_else(|| "malformed chunked ACME response".to_string())?;
-        let size_line = std::str::from_utf8(&data[..pos]).map_err(|_| "invalid chunk size")?;
-        let hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(hex, 16).map_err(|_| "invalid hex chunk size")?;
-        data = &data[pos + 2..];
-        if size == 0 {
-            break;
-        }
-        if data.len() < size + 2 {
-            return Err("truncated chunked ACME response".into());
-        }
-        out.extend_from_slice(&data[..size]);
-        data = &data[size + 2..];
-    }
-    Ok(out)
+    Ok((authority, 443, path))
 }
 
 fn read_der_len(buf: &[u8], pos: &mut usize) -> Option<usize> {
