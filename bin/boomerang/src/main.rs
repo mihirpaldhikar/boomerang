@@ -77,7 +77,7 @@ async fn main() {
 
     match cli.command {
         Commands::Start => {
-            let http_server = match HttpServer::builder(cfg.server.port).build().await {
+            let http_server = match HttpServer::builder(cfg.server.port).build() {
                 Ok(srv) => srv,
                 Err(e) => {
                     eprintln!("server error: {}", e.to_string());

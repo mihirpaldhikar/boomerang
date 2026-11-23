@@ -113,7 +113,7 @@ impl HttpServerBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<HttpServer, HttpServerError> {
+    pub fn build(self) -> Result<HttpServer, HttpServerError> {
         #[cfg(target_os = "linux")]
         prewarm_linux_fd_table();
 
