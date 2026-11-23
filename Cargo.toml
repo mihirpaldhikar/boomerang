@@ -20,9 +20,10 @@ panic = "abort"
 inherits = "release"
 debug = true
 strip = "none"
-lto = "off"
-opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+split-debuginfo = "off"
 
 [workspace.dependencies]
 # Local Crates
