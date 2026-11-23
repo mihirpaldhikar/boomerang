@@ -258,9 +258,14 @@ impl FieldLines {
     pub(crate) fn set<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, value: V) {
         let key_bytes = key.as_ref().as_bytes();
         let val_bytes = value.as_ref().as_bytes();
-        if key_bytes.is_empty() {
+
+        if key_bytes.is_empty()
+            || has_invalid_header_bytes(key_bytes)
+            || has_invalid_header_bytes(val_bytes)
+        {
             return;
         }
+
         let key_len = key_bytes.len() as u32;
         let slot = known_slot(key_bytes);
 
@@ -396,4 +401,9 @@ impl FieldLines {
             (k, v)
         })
     }
+}
+
+#[inline]
+fn has_invalid_header_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7F)
 }
