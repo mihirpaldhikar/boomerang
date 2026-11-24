@@ -153,13 +153,15 @@ impl CookieStore {
         if trimmed.len() != k.len() {
             k = trimmed.to_owned();
         }
-        self.map.insert(
-            k,
-            Cookie {
-                value: value.into(),
-                options,
-            },
-        );
+        let v: String = value.into();
+
+        if !crate::protocol::field_lines::is_valid_header_name(k.as_bytes())
+            || has_invalid_cookie_bytes(v.as_bytes())
+        {
+            return;
+        }
+
+        self.map.insert(k, Cookie { value: v, options });
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
@@ -185,13 +187,17 @@ impl CookieStore {
 
             if let Some(options) = &cookie.options {
                 if let Some(domain) = &options.domain {
-                    buf.put_slice(b"; Domain=");
-                    buf.put_slice(domain.as_bytes());
+                    if !has_invalid_cookie_bytes(domain.as_bytes()) {
+                        buf.put_slice(b"; Domain=");
+                        buf.put_slice(domain.as_bytes());
+                    }
                 }
 
                 if let Some(path) = &options.path {
-                    buf.put_slice(b"; Path=");
-                    buf.put_slice(path.as_bytes());
+                    if !has_invalid_cookie_bytes(path.as_bytes()) {
+                        buf.put_slice(b"; Path=");
+                        buf.put_slice(path.as_bytes());
+                    }
                 }
 
                 if let Some(expires) = &options.expires {
@@ -344,4 +350,9 @@ pub(crate) fn format_http_date_bytes(secs: u64, out: &mut [u8; 29]) {
     out[22] = b':';
     write_two_digits(sec, &mut out[23..25]);
     out[25..29].copy_from_slice(b" GMT");
+}
+
+#[inline]
+fn has_invalid_cookie_bytes(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b < 0x20 || b == 0x7F || b == b';')
 }
