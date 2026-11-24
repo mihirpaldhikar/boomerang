@@ -144,21 +144,28 @@ impl HttpCall {
 
         let content_type = self.header("content-type").map(|s| s.to_string());
 
-        let body = if is_chunked {
-            Body::read_chunked(
-                &mut self.connection,
-                self.request.max_body_size,
-                content_type,
-            )
-            .await?
-        } else {
-            Body::read_exact(
-                &mut self.connection,
-                content_length,
-                self.request.max_body_size,
-                content_type,
-            )
-            .await?
+        let body_fut = async {
+            if is_chunked {
+                Body::read_chunked(
+                    &mut self.connection,
+                    self.request.max_body_size,
+                    content_type,
+                )
+                .await
+            } else {
+                Body::read_exact(
+                    &mut self.connection,
+                    content_length,
+                    self.request.max_body_size,
+                    content_type,
+                )
+                .await
+            }
+        };
+
+        let body = match tokio::time::timeout(self.request.request_timeout, body_fut).await {
+            Ok(res) => res?,
+            Err(_) => return Err("Timed out reading request body".into()),
         };
 
         self.request.body_state = BodyState::Read(body);
@@ -286,24 +293,32 @@ impl HttpCall {
 
 impl HttpCall {
     pub(crate) async fn discard_unread_body(&mut self) -> Result<(), std::io::Error> {
+        use bytes::Buf;
+
         let state = std::mem::replace(&mut self.request.body_state, BodyState::Reading);
 
         let (content_length, is_chunked) = match state {
+            BodyState::Read(_) => return Ok(()),
+            BodyState::Reading => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Incomplete body read forces connection close",
+                ));
+            }
             BodyState::Unread {
                 content_length,
                 is_chunked,
             } => (content_length, is_chunked),
-            _ => return Ok(()),
         };
 
         if content_length == 0 && !is_chunked {
             return Ok(());
         }
 
-        if is_chunked {
+        if is_chunked || content_length > 64 * 1024 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Unread chunked body forces connection close",
+                "Large or chunked unread body forces connection close",
             ));
         }
 
@@ -311,8 +326,8 @@ impl HttpCall {
 
         let avail = self.connection.reader.len();
         if avail > 0 {
-            let take = std::cmp::min(remaining, avail);
-            let _ = self.connection.reader.split_to(take);
+            let take = remaining.min(avail);
+            self.connection.reader.advance(take);
             remaining -= take;
         }
 
@@ -320,41 +335,31 @@ impl HttpCall {
             return Ok(());
         }
 
-        if self.connection.flush_pipeline().await.is_err() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "Failed to flush response before draining body",
-            ));
-        }
+        self.connection.flush_pipeline().await?;
 
-        while remaining > 0 {
-            self.connection.reader.reserve(remaining.min(8192));
-
-            let read_fut = self.connection.read_more();
-
-            let n = match tokio::time::timeout(std::time::Duration::from_secs(5), read_fut).await {
-                Ok(Ok(n)) => n,
-                _ => {
+        let drain_fut = async {
+            while remaining > 0 {
+                let n = self.connection.read_more().await?;
+                if n == 0 {
                     return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "Timeout or EOF while draining unread body",
+                        std::io::ErrorKind::UnexpectedEof,
+                        "EOF while draining unread body",
                     ));
                 }
-            };
-
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "EOF while draining unread body",
-                ));
+                let take = remaining.min(self.connection.reader.len());
+                self.connection.reader.advance(take);
+                remaining -= take;
             }
+            Ok(())
+        };
 
-            let avail = self.connection.reader.len();
-            let take = std::cmp::min(remaining, avail);
-            let _ = self.connection.reader.split_to(take);
-            remaining -= take;
-        }
-
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(2), drain_fut)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "Timeout while draining unread body",
+                )
+            })?
     }
 }

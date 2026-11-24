@@ -261,6 +261,8 @@ pub(crate) struct HttpRequest {
 
     pub(crate) path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
     pub(crate) query_params: OnceLock<Vec<(Arc<str>, Arc<str>)>>,
+
+    pub(crate) request_timeout: std::time::Duration,
 }
 
 #[inline]
@@ -314,6 +316,7 @@ impl HttpRequest {
         header_bytes: &[u8],
         peer_addr: SocketAddr,
         max_body_size: usize,
+        request_timeout: std::time::Duration,
         mut field_lines: FieldLines,
         mut route: String,
         mut path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
@@ -379,7 +382,7 @@ impl HttpRequest {
             (method, version)
         };
 
-        field_lines.parse_into(&header_bytes[req_line_end + 1..]);
+        let _ = field_lines.parse_into(&header_bytes[req_line_end + 1..]);
 
         let has_te = field_lines.get("transfer-encoding");
         let has_cl = field_lines.get("content-length");
@@ -417,6 +420,7 @@ impl HttpRequest {
             },
             path_params,
             query_params: OnceLock::new(),
+            request_timeout,
         })
     }
 
