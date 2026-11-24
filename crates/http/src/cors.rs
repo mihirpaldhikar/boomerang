@@ -46,7 +46,6 @@ impl Cors {
     #[inline]
     fn resolve_allow_origin<'a>(&self, origin: Option<&'a str>) -> Option<&'a str> {
         match (&self.allowed_origin, origin) {
-            (AllowedOrigin::Any, Some(o)) if self.allow_credentials => Some(o),
             (AllowedOrigin::Any, _) => Some("*"),
             (AllowedOrigin::Only(list), Some(o))
                 if list.iter().any(|allowed| allowed.eq_ignore_ascii_case(o)) =>
@@ -280,6 +279,11 @@ impl<MethodState, HeaderState> CorsBuilder<Restricted<String>, MethodState, Head
         }
         self
     }
+
+    pub fn allow_credentials(mut self, value: bool) -> Self {
+        self.allow_credentials = value;
+        self
+    }
 }
 
 impl<OriginState, HeaderState> CorsBuilder<OriginState, Restricted<HttpMethod>, HeaderState> {
@@ -299,11 +303,6 @@ impl<OriginState, MethodState> CorsBuilder<OriginState, MethodState, Restricted<
 impl<OriginState, MethodState, HeaderState> CorsBuilder<OriginState, MethodState, HeaderState> {
     pub fn add_exposed_header<S: Into<String>>(mut self, header: S) -> Self {
         self.exposed_headers.push(header.into());
-        self
-    }
-
-    pub fn allow_credentials(mut self, value: bool) -> Self {
-        self.allow_credentials = value;
         self
     }
 
@@ -328,6 +327,9 @@ impl<OriginState, MethodState, HeaderState> CorsBuilder<OriginState, MethodState
             let _ = write!(methods_str, "{m}");
         }
 
+        let allow_credentials =
+            self.allow_credentials && !matches!(self.allowed_origin, AllowedOrigin::Any);
+
         let allow_any_header =
             self.allowed_headers.is_empty() || self.allowed_headers.iter().any(|h| h == "*");
         let allowed_headers_str = if allow_any_header {
@@ -351,7 +353,7 @@ impl<OriginState, MethodState, HeaderState> CorsBuilder<OriginState, MethodState
             allow_any_header,
             allowed_headers_str,
             exposed_headers_str,
-            allow_credentials: self.allow_credentials,
+            allow_credentials,
             max_age_str,
         }
     }
