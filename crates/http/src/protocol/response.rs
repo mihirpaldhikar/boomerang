@@ -169,21 +169,86 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         }))
     }
 
-    pub fn stream<R: AsyncRead + Unpin + Send + Sync + 'static, C: Into<Cow<'static, str>>>(
+    pub fn stream_from<S, C>(
         mut self,
-        reader: R,
+        source: S,
+        content_type: C,
+    ) -> HttpResponse<HttpResponseBodyInitialized>
+    where
+        S: crate::protocol::stream::IntoBodyStream + 'static,
+        C: Into<Cow<'static, str>>,
+    {
+        self.content_type = Some(content_type.into());
+        self.is_chunked = true;
+        self.content_length = None;
+        self.into_initialized(Some(Body::ChunkStream {
+            source: Box::new(source.into_body_stream()),
+            content_length: None,
+        }))
+    }
+
+    pub fn stream_from_len<S, C>(
+        mut self,
+        source: S,
         content_len: u64,
         content_type: C,
-    ) -> HttpResponse<HttpResponseBodyInitialized> {
+    ) -> HttpResponse<HttpResponseBodyInitialized>
+    where
+        S: crate::protocol::stream::IntoBodyStream + 'static,
+        C: Into<Cow<'static, str>>,
+    {
         self.content_type = Some(content_type.into());
-        if content_len == 0 {
-            self.is_chunked = true;
-            self.content_length = None;
-        } else {
-            self.is_chunked = false;
-            self.content_length = Some(content_len);
-        }
-        self.into_initialized(Some(Body::from_stream(reader, content_len, None)))
+        self.is_chunked = false;
+        self.content_length = Some(content_len);
+        self.into_initialized(Some(Body::ChunkStream {
+            source: Box::new(source.into_body_stream()),
+            content_length: Some(content_len),
+        }))
+    }
+
+    pub fn stream_with<F, Fut, E, C>(
+        mut self,
+        content_type: C,
+        producer: F,
+    ) -> HttpResponse<HttpResponseBodyInitialized>
+    where
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: crate::protocol::stream::StreamError,
+        C: Into<Cow<'static, str>>,
+    {
+        let (tx, rx) = crate::protocol::stream::stream_channel(16);
+        let handle = tokio::spawn(async move {
+            let err_tx = tx.clone();
+            if let Err(err) = producer(tx).await {
+                err_tx.apply_error(err).await;
+            }
+        });
+
+        self.content_type = Some(content_type.into());
+        self.is_chunked = true;
+        self.content_length = None;
+        self.into_initialized(Some(Body::ChunkStream {
+            source: Box::new(crate::protocol::stream::ManagedStreamSource {
+                inner: rx,
+                handle: Some(handle),
+            }),
+            content_length: None,
+        }))
+    }
+
+    pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponse<HttpResponseBodyInitialized>
+    where
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: crate::protocol::stream::StreamError,
+    {
+        self.__add_header_internal("cache-control", "no-cache")
+            .stream_with(Cow::Borrowed("text/event-stream"), producer)
+    }
+
+    pub fn declare_trailers<S: AsRef<str>>(self, header_names: S) -> Self {
+        self.__add_header_internal("trailer", header_names.as_ref())
     }
 
     pub fn empty(self) -> HttpResponse<HttpResponseBodyInitialized> {
@@ -213,6 +278,7 @@ impl HttpResponse<HttpResponseBodyInitialized> {
         let is_compressible = self
             .content_type
             .as_deref()
+            .filter(|ct| !ct.eq_ignore_ascii_case("text/event-stream"))
             .map(Compress::is_compressible)
             .unwrap_or(false);
 
@@ -303,43 +369,73 @@ impl HttpResponse<HttpResponseBodyInitialized> {
                 content_type,
                 ..
             } => {
-                self.field_lines.remove("content-length");
-                self.content_length = None;
-                self.is_chunked = true;
-                self.field_lines.set("content-encoding", encoding);
-                self.field_lines.set("vary", "Accept-Encoding");
-
-                let reader = BufReader::with_capacity(64 * 1024, reader);
-                let compressed_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = match encoding {
-                    "zstd" => Box::new(
-                        async_compression::tokio::bufread::ZstdEncoder::with_quality(
-                            reader,
-                            async_compression::Level::Fastest,
-                        ),
-                    ),
-                    "br" => Box::new(
-                        async_compression::tokio::bufread::BrotliEncoder::with_quality(
-                            reader,
-                            async_compression::Level::Precise(4),
-                        ),
-                    ),
-                    _ => Box::new(
-                        async_compression::tokio::bufread::GzipEncoder::with_quality(
-                            reader,
-                            async_compression::Level::Fastest,
-                        ),
-                    ),
-                };
-
-                self.body = Some(Body::Stream {
-                    reader: compressed_reader,
-                    content_length: 0,
+                self.body = Some(Self::wrap_compressed_stream(
+                    reader,
                     content_type,
-                });
+                    encoding,
+                    &mut self.content_length,
+                    &mut self.is_chunked,
+                    &mut self.field_lines,
+                ));
+            }
+            Body::ChunkStream { source, .. } => {
+                let reader: Box<dyn AsyncRead + Unpin + Send> =
+                    Box::new(crate::protocol::stream::ChunkSourceReader::new(source));
+                self.body = Some(Self::wrap_compressed_stream(
+                    reader,
+                    None,
+                    encoding,
+                    &mut self.content_length,
+                    &mut self.is_chunked,
+                    &mut self.field_lines,
+                ));
             }
         }
 
         self
+    }
+
+    fn wrap_compressed_stream(
+        reader: Box<dyn AsyncRead + Unpin + Send>,
+        content_type: Option<String>,
+        encoding: &'static str,
+        content_length: &mut Option<u64>,
+        is_chunked: &mut bool,
+        field_lines: &mut FieldLines,
+    ) -> Body {
+        field_lines.remove("content-length");
+        *content_length = None;
+        *is_chunked = true;
+        field_lines.set("content-encoding", encoding);
+        field_lines.set("vary", "Accept-Encoding");
+
+        let buffered = BufReader::with_capacity(64 * 1024, reader);
+        let compressed_reader: Box<dyn AsyncRead + Unpin + Send> = match encoding {
+            "zstd" => Box::new(
+                async_compression::tokio::bufread::ZstdEncoder::with_quality(
+                    buffered,
+                    async_compression::Level::Fastest,
+                ),
+            ),
+            "br" => Box::new(
+                async_compression::tokio::bufread::BrotliEncoder::with_quality(
+                    buffered,
+                    async_compression::Level::Precise(4),
+                ),
+            ),
+            _ => Box::new(
+                async_compression::tokio::bufread::GzipEncoder::with_quality(
+                    buffered,
+                    async_compression::Level::Fastest,
+                ),
+            ),
+        };
+
+        Body::Stream {
+            reader: compressed_reader,
+            content_length: 0,
+            content_type,
+        }
     }
 }
 
@@ -495,18 +591,59 @@ impl<'a> HttpResponseInit<'a> {
         }
     }
 
-    pub fn stream<R: AsyncRead + Unpin + Send + Sync + 'static, C: Into<Cow<'static, str>>>(
-        self,
-        reader: R,
-        len: u64,
-        ct: C,
-    ) -> HttpResponseReady<'a> {
+    pub fn stream_from<S, C>(self, source: S, content_type: C) -> HttpResponseReady<'a>
+    where
+        S: crate::protocol::stream::IntoBodyStream + 'static,
+        C: Into<Cow<'static, str>>,
+    {
         HttpResponseReady {
             connection: self.connection,
-            response: self.response.stream(reader, len, ct),
+            response: self.response.stream_from(source, content_type),
         }
     }
 
+    pub fn stream_from_len<S, C>(
+        self,
+        source: S,
+        content_len: u64,
+        content_type: C,
+    ) -> HttpResponseReady<'a>
+    where
+        S: crate::protocol::stream::IntoBodyStream + 'static,
+        C: Into<Cow<'static, str>>,
+    {
+        HttpResponseReady {
+            connection: self.connection,
+            response: self
+                .response
+                .stream_from_len(source, content_len, content_type),
+        }
+    }
+
+    pub fn stream_with<F, Fut, E, C>(self, content_type: C, producer: F) -> HttpResponseReady<'a>
+    where
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: crate::protocol::stream::StreamError,
+        C: Into<Cow<'static, str>>,
+    {
+        HttpResponseReady {
+            connection: self.connection,
+            response: self.response.stream_with(content_type, producer),
+        }
+    }
+
+    pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponseReady<'a>
+    where
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: crate::protocol::stream::StreamError,
+    {
+        HttpResponseReady {
+            connection: self.connection,
+            response: self.response.sse(producer),
+        }
+    }
     pub fn empty(self) -> HttpResponseReady<'a> {
         HttpResponseReady {
             connection: self.connection,

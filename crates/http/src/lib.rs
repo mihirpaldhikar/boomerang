@@ -34,9 +34,12 @@ pub use http_macros::{route, static_files};
 #[doc(hidden)]
 pub use bytes as __bytes;
 
-pub use protocol::{HttpMethod, HttpStatus};
+pub use protocol::{
+    HttpMethod, HttpStatus, IntoBodyStream, StreamChunk, StreamClosed, StreamReceiver,
+    StreamSender, stream_channel,
+};
 pub use router::{
     __register_route, MiddlewareHandler, RouteDefinition, RouteEntry, RouteHandler, SmallFuture,
 };
 pub use server::{HttpCall, HttpServer, HttpServerError, RestartContext};
-pub use tls::{TlsConfig, AcmeChallengeMode};
+pub use tls::{AcmeChallengeMode, TlsConfig};

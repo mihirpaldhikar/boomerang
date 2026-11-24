@@ -42,9 +42,13 @@ pub enum Body {
         content_type: Option<String>,
     },
     Stream {
-        reader: Box<dyn AsyncRead + Unpin + Send + Sync>,
+        reader: Box<dyn AsyncRead + Unpin + Send>,
         content_length: u64,
         content_type: Option<String>,
+    },
+    ChunkStream {
+        source: Box<dyn crate::protocol::stream::ChunkSource>,
+        content_length: Option<u64>,
     },
 }
 
@@ -80,7 +84,7 @@ impl Body {
         content_type: Option<String>,
     ) -> Self
     where
-        R: AsyncRead + Unpin + Send + Sync + 'static,
+        R: AsyncRead + Unpin + Send + 'static,
     {
         Self::Stream {
             reader: Box::new(reader),
@@ -254,7 +258,7 @@ impl Body {
                 bytes,
                 content_type,
             } => (bytes, content_type),
-            Self::Stream { .. } => return None,
+            Self::Stream { .. } | Self::ChunkStream { .. } => return None,
         };
         match content_type {
             Some(ct)
@@ -274,7 +278,9 @@ impl Body {
                 bytes,
                 content_type,
             } => (bytes.clone(), content_type),
-            Self::PooledVec { .. } | Self::Stream { .. } => return None,
+            Self::PooledVec { .. } | Self::Stream { .. } | Self::ChunkStream { .. } => {
+                return None;
+            }
         };
 
         match content_type {
@@ -302,13 +308,13 @@ impl Body {
         match self {
             Body::Bytes { bytes, .. } => bytes.clone(),
             Body::PooledVec { bytes, .. } => Bytes::copy_from_slice(bytes),
-            Body::Stream { .. } => {
+            Body::Stream { .. } | Body::ChunkStream { .. } => {
                 panic!("cannot convert stream body to bytes")
             }
         }
     }
 
     pub fn is_stream(&self) -> bool {
-        matches!(self, Body::Stream { .. })
+        matches!(self, Body::Stream { .. } | Body::ChunkStream { .. })
     }
 }

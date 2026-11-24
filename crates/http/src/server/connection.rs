@@ -627,44 +627,60 @@ impl Connection {
         let is_chunked = response.is_chunked;
 
         let pipelining = !self.reader.is_empty();
+        let mut header_buf_opt = Some(header_buf);
+        let mut resp_fields_opt = Some(response.field_lines);
         let mut recycled_body: Option<Vec<u8>> = None;
 
         let write_res: Result<(), tokio::io::Error> = async {
+            let hb = header_buf_opt.as_ref().unwrap();
             match (write_body, is_chunked, response.body) {
                 (true, false, Some(Body::Bytes { bytes, .. })) => {
-                    if pipelining
-                        && self.pipeline_buf.len() + header_buf.len() + bytes.len() <= 8 * 1024
-                    {
-                        self.pipeline_buf.extend_from_slice(&header_buf);
+                    if pipelining && self.pipeline_buf.len() + hb.len() + bytes.len() <= 8 * 1024 {
+                        self.pipeline_buf.extend_from_slice(hb);
                         self.pipeline_buf.extend_from_slice(&bytes);
                     } else {
                         self.flush_pipeline().await?;
-                        write_all_vectored_pair(&mut self.transport, &header_buf, &bytes).await?;
+                        write_all_vectored_pair(&mut self.transport, hb, &bytes).await?;
                     }
                 }
                 (true, false, Some(Body::PooledVec { bytes, .. })) => {
-                    if pipelining
-                        && self.pipeline_buf.len() + header_buf.len() + bytes.len() <= 8 * 1024
-                    {
-                        self.pipeline_buf.extend_from_slice(&header_buf);
+                    if pipelining && self.pipeline_buf.len() + hb.len() + bytes.len() <= 8 * 1024 {
+                        self.pipeline_buf.extend_from_slice(hb);
                         self.pipeline_buf.extend_from_slice(&bytes);
                     } else {
                         self.flush_pipeline().await?;
-                        write_all_vectored_pair(&mut self.transport, &header_buf, &bytes).await?;
+                        write_all_vectored_pair(&mut self.transport, hb, &bytes).await?;
                     }
                     recycled_body = Some(bytes);
                 }
                 (false, _, _) | (true, false, None) => {
-                    if pipelining && self.pipeline_buf.len() + header_buf.len() <= 8 * 1024 {
-                        self.pipeline_buf.extend_from_slice(&header_buf);
+                    if pipelining && self.pipeline_buf.len() + hb.len() <= 8 * 1024 {
+                        self.pipeline_buf.extend_from_slice(hb);
                     } else {
                         self.flush_pipeline().await?;
-                        self.transport.write_all(&header_buf).await?;
+                        self.transport.write_all(hb).await?;
                     }
                 }
                 (true, _, body) => {
                     self.flush_pipeline().await?;
-                    self.transport.write_all(&header_buf).await?;
+                    self.transport.write_all(hb).await?;
+
+                    let mut hb_owned = header_buf_opt.take().unwrap();
+                    let mut rf_owned = resp_fields_opt.take().unwrap();
+                    hb_owned.clear();
+                    rf_owned.clear();
+                    WORKER_SCRATCH.with(|cell| {
+                        let mut s = cell.borrow_mut();
+                        if s.header_buf.capacity() == 0 && hb_owned.capacity() <= 16 * 1024 {
+                            s.header_buf = hb_owned;
+                        }
+                        if s.resp_fields.arena_capacity() == 0
+                            && rf_owned.arena_capacity() <= 16 * 1024
+                        {
+                            s.resp_fields = rf_owned;
+                        }
+                    });
+
                     recycled_body = self.write_body_slow(body, is_chunked).await?;
                 }
             }
@@ -672,17 +688,19 @@ impl Connection {
         }
         .await;
 
-        let mut resp_fields = response.field_lines;
-        resp_fields.clear();
-        header_buf.clear();
-
         WORKER_SCRATCH.with(|cell| {
             let mut s = cell.borrow_mut();
-            if s.header_buf.capacity() == 0 && header_buf.capacity() <= 16 * 1024 {
-                s.header_buf = header_buf;
+            if let Some(mut hb) = header_buf_opt {
+                hb.clear();
+                if s.header_buf.capacity() == 0 && hb.capacity() <= 16 * 1024 {
+                    s.header_buf = hb;
+                }
             }
-            if s.resp_fields.arena_capacity() == 0 && resp_fields.arena_capacity() <= 16 * 1024 {
-                s.resp_fields = resp_fields;
+            if let Some(mut rf) = resp_fields_opt {
+                rf.clear();
+                if s.resp_fields.arena_capacity() == 0 && rf.arena_capacity() <= 16 * 1024 {
+                    s.resp_fields = rf;
+                }
             }
             if let Some(mut body_buf) = recycled_body {
                 body_buf.clear();
@@ -742,6 +760,107 @@ impl Connection {
                 } else {
                     let mut buffered = BufReader::with_capacity(64 * 1024, reader);
                     tokio::io::copy_buf(&mut buffered, &mut self.transport).await?;
+                }
+                Ok(None)
+            }
+            Some(Body::ChunkStream {
+                mut source,
+                content_length,
+            }) => {
+                let mut written: u64 = 0;
+                let mut sent_terminator = false;
+                loop {
+                    let next = std::future::poll_fn(|cx| source.poll_next(cx)).await;
+                    match next {
+                        Some(crate::protocol::StreamPoll::Data(chunk)) => {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            if !is_chunked
+                                && let Some(expected) = content_length
+                                && written + (chunk.len() as u64) > expected
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "stream exceeded declared Content-Length",
+                                ));
+                            }
+
+                            let write_fut = async {
+                                if is_chunked {
+                                    let mut hex_buf = [0u8; 18];
+                                    let hex_str = format_hex(chunk.len(), &mut hex_buf);
+                                    write_all_vectored_triple(
+                                        &mut self.transport,
+                                        hex_str,
+                                        &chunk,
+                                        b"\r\n",
+                                    )
+                                    .await
+                                } else {
+                                    self.transport.write_all(&chunk).await
+                                }
+                            };
+
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                write_fut,
+                            )
+                            .await
+                            {
+                                Ok(res) => res?,
+                                Err(_) => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "stream write timed out",
+                                    ));
+                                }
+                            }
+                            written += chunk.len() as u64;
+                        }
+                        Some(crate::protocol::StreamPoll::Trailers(trailers)) => {
+                            if is_chunked {
+                                let mut tbuf = Vec::with_capacity(128);
+                                tbuf.extend_from_slice(b"0\r\n");
+                                for (k, v) in trailers {
+                                    let valid_k = !k.is_empty()
+                                        && k.bytes().all(|b| {
+                                            b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+                                        });
+                                    let valid_v =
+                                        !v.bytes().any(|b| (b < 0x20 && b != b'\t') || b == 0x7F);
+                                    if valid_k && valid_v {
+                                        tbuf.extend_from_slice(k.as_bytes());
+                                        tbuf.extend_from_slice(b": ");
+                                        tbuf.extend_from_slice(v.as_bytes());
+                                        tbuf.extend_from_slice(b"\r\n");
+                                    }
+                                }
+                                tbuf.extend_from_slice(b"\r\n");
+                                self.transport.write_all(&tbuf).await?;
+                                sent_terminator = true;
+                            }
+                            break;
+                        }
+                        Some(crate::protocol::StreamPoll::Abort) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "stream aborted by producer",
+                            ));
+                        }
+                        None => break,
+                    }
+                }
+
+                if is_chunked && !sent_terminator {
+                    self.transport.write_all(b"0\r\n\r\n").await?;
+                } else if !is_chunked && let Some(expected) = content_length {
+                    if written != expected {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "stream ended before declared Content-Length",
+                        ));
+                    }
                 }
                 Ok(None)
             }
