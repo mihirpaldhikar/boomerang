@@ -160,6 +160,10 @@ impl HttpServerBuilder {
             _ => None,
         };
 
+        let exe_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+
         Ok(HttpServer {
             router: Router::build(),
             listeners,
@@ -178,6 +182,7 @@ impl HttpServerBuilder {
             tls_background,
             acme_challenges,
             acme_webroot: self.acme_webroot,
+            exe_path,
         })
     }
 }

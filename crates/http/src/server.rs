@@ -370,6 +370,7 @@ pub struct HttpServer {
     restart_stability_window: std::time::Duration,
     restart_pre_hook_timeout: std::time::Duration,
     max_body_size: usize,
+    exe_path: Option<std::path::PathBuf>,
 }
 
 impl HttpServer {
@@ -486,32 +487,37 @@ impl HttpServer {
                         restart_in_progress = true;
                         println!("Restart triggered. Force: {}", restart_req.force);
 
-                        let mut current_exe = match std::env::current_exe() {
-                            Ok(exe) => exe,
+                        let exe_path = match &server.exe_path {
+                            Some(p) if p.is_absolute() && p.exists() => p.clone(),
+                            _ => match std::env::current_exe() {
+                                Ok(p) if p.is_absolute() && p.exists() => p,
+                                Ok(p) => {
+                                    println!(
+                                        "Restart aborted: executable path '{}' is unavailable.",
+                                        p.display()
+                                    );
+                                    restart_in_progress = false;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    println!("Failed to get executable path: {}", e);
+                                    restart_in_progress = false;
+                                    continue;
+                                }
+                            },
+                        };
+
+                        let mut child = match std::process::Command::new(&exe_path)
+                            .args(std::env::args().skip(1))
+                            .spawn()
+                        {
+                            Ok(c) => c,
                             Err(e) => {
-                                println!("Failed to get executable path: {}", e);
+                                println!("Failed to spawn new process: {}", e);
                                 restart_in_progress = false;
                                 continue;
                             }
                         };
-
-                        if !current_exe.exists() {
-                            current_exe =
-                                std::path::PathBuf::from(std::env::args().next().unwrap());
-                        }
-
-                        let mut child =
-                            match std::process::Command::new(&current_exe)
-                                .args(std::env::args().skip(1))
-                                .spawn()
-                            {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    println!("Failed to spawn new process: {}", e);
-                                    restart_in_progress = false;
-                                    continue;
-                                }
-                            };
 
                         *child_pid.lock().unwrap() = Some(child.id());
 
