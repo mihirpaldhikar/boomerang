@@ -95,26 +95,41 @@ impl Body {
         max_body_size: usize,
         content_type: Option<String>,
     ) -> Result<Self, String> {
+        use bytes::Buf;
+
         if content_len > max_body_size {
             return Err("body too large".to_string());
         }
 
-        let missing = content_len.saturating_sub(conn.reader.len());
-        if missing > 0 {
-            conn.reader.reserve(missing);
+        if conn.reader.len() >= content_len {
+            let bytes = conn.reader.split_to(content_len).freeze();
+            return Ok(Self::Bytes {
+                bytes,
+                content_type,
+            });
         }
 
-        while conn.reader.len() < content_len {
+        // Grow incrementally so slow/stalled clients cannot
+        // force multi-MB allocations before sending payload bytes.
+        let mut out = Vec::with_capacity(content_len.min(64 * 1024));
+        if !conn.reader.is_empty() {
+            out.extend_from_slice(&conn.reader);
+            conn.reader.clear();
+        }
+
+        while out.len() < content_len {
             let n = conn.read_more().await.map_err(|e| e.to_string())?;
             if n == 0 {
                 return Err("stream closed unexpectedly".into());
             }
+            let remaining = content_len - out.len();
+            let take = remaining.min(conn.reader.len());
+            out.extend_from_slice(&conn.reader[..take]);
+            conn.reader.advance(take);
         }
 
-        let bytes = conn.reader.split_to(content_len).freeze();
-
         Ok(Self::Bytes {
-            bytes,
+            bytes: out.into(),
             content_type,
         })
     }
@@ -133,21 +148,30 @@ impl Body {
                 if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
                     break pos;
                 }
-
+                if conn.reader.len() > 4096 {
+                    return Err("chunk size line too long".to_string());
+                }
                 let n = conn.read_more().await.map_err(|e| e.to_string())?;
                 if n == 0 {
                     return Err("stream closed unexpectedly".into());
                 }
             };
 
+            if pos == 0 || conn.reader[pos - 1] != b'\r' {
+                return Err("invalid chunk size line ending".to_string());
+            }
+            if pos > 4096 {
+                return Err("chunk size line too long".to_string());
+            }
+
             let chunk_size = {
-                let size_str = std::str::from_utf8(&conn.reader[..=pos])
-                    .map_err(|_| "invalid chunk size line")?
-                    .trim()
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim();
+                let line = std::str::from_utf8(&conn.reader[..pos - 1])
+                    .map_err(|_| "invalid chunk size line")?;
+                let size_str = line.split(';').next().unwrap_or("").trim();
+
+                if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!("invalid chunk size: '{}'", size_str));
+                }
 
                 usize::from_str_radix(size_str, 16)
                     .map_err(|_| format!("invalid chunk size: '{}'", size_str))?
@@ -155,16 +179,31 @@ impl Body {
             conn.reader.advance(pos + 1);
 
             if chunk_size == 0 {
+                let mut trailer_bytes = 0usize;
                 loop {
-                    if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
-                        conn.reader.advance(pos + 1);
-                        break;
+                    let t_pos = loop {
+                        if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
+                            break pos;
+                        }
+                        if conn.reader.len() > 16 * 1024 {
+                            return Err("chunk trailers too large".to_string());
+                        }
+                        let n = conn.read_more().await.map_err(|e| e.to_string())?;
+                        if n == 0 {
+                            return Err("stream closed before chunk trailers finished".to_string());
+                        }
+                    };
+                    if t_pos == 0 || conn.reader[t_pos - 1] != b'\r' {
+                        return Err("invalid chunk trailer line ending".to_string());
                     }
-                    if conn.reader.capacity() < 4096 {
-                        conn.reader.reserve(8192);
+                    let line_len = t_pos + 1;
+                    trailer_bytes += line_len;
+                    if trailer_bytes > 16 * 1024 {
+                        return Err("chunk trailers too large".to_string());
                     }
-                    let n = conn.read_more().await.map_err(|e| e.to_string())?;
-                    if n == 0 {
+                    let is_empty_line = t_pos == 1;
+                    conn.reader.advance(line_len);
+                    if is_empty_line {
                         break;
                     }
                 }
@@ -176,12 +215,7 @@ impl Body {
                 .checked_add(chunk_size)
                 .filter(|&l| l <= max_body_size)
                 .ok_or_else(|| "body too large".to_string())?;
-            body.reserve(new_len - body.len());
-
-            let missing = chunk_size.saturating_sub(conn.reader.len());
-            if missing > 0 {
-                conn.reader.reserve(missing);
-            }
+            body.reserve((new_len - body.len()).min(64 * 1024));
 
             while conn.reader.len() < chunk_size {
                 let n = conn.read_more().await.map_err(|e| e.to_string())?;
@@ -193,9 +227,6 @@ impl Body {
             conn.reader.advance(chunk_size);
 
             while conn.reader.len() < 2 {
-                if conn.reader.capacity() < 4096 {
-                    conn.reader.reserve(8192);
-                }
                 let n = conn.read_more().await.map_err(|e| e.to_string())?;
                 if n == 0 {
                     return Err("stream closed unexpectedly".into());
@@ -213,7 +244,7 @@ impl Body {
         })
     }
 
-    pub fn as_json(&self) -> Option<json::JsonValue> {
+    pub fn as_json(&self) -> Option<JsonValue> {
         let (slice, content_type): (&[u8], &Option<String>) = match self {
             Self::Bytes {
                 bytes,
