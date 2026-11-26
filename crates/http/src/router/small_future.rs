@@ -38,14 +38,11 @@ pub struct SmallFuture<'a, T> {
     _marker: PhantomData<&'a mut ()>,
 }
 
-// SAFETY: `SmallFuture::new` requires `F: Send`.
-unsafe impl<'a, T> Send for SmallFuture<'a, T> {}
-
 impl<'a, T> SmallFuture<'a, T> {
     #[inline]
     pub fn new<F>(fut: F) -> Self
     where
-        F: Future<Output = T> + Send + 'a,
+        F: Future<Output = T> + 'a,
     {
         unsafe fn poll_impl<F: Future>(ptr: *mut u8, cx: &mut Context<'_>) -> Poll<F::Output> {
             unsafe { Pin::new_unchecked(&mut *(ptr as *mut F)).poll(cx) }
