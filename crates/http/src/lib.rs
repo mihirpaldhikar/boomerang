@@ -29,7 +29,7 @@ pub mod static_files;
 mod tls;
 
 #[cfg(feature = "derive")]
-pub use http_macros::{route, static_files};
+pub use http_macros::{route, static_files, json};
 
 #[doc(hidden)]
 pub use bytes as __bytes;
@@ -43,3 +43,8 @@ pub use router::{
 };
 pub use server::{HttpCall, HttpServer, HttpServerError, RestartContext};
 pub use tls::{AcmeChallengeMode, TlsConfig};
+
+#[doc(hidden)]
+pub mod __json {
+    pub use crate::protocol::{IntoJsonValue, JsonValue};
+}

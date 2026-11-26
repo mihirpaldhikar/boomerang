@@ -577,3 +577,148 @@ pub fn static_files(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     .into()
 }
+
+enum JsonKey {
+    Lit(LitStr),
+    Expr(syn::Expr),
+}
+
+enum JsonAst {
+    Null,
+    Bool(bool),
+    Array(Vec<JsonAst>),
+    Object(Vec<(JsonKey, JsonAst)>),
+    Expr(syn::Expr),
+}
+
+impl Parse for JsonAst {
+    fn parse(input: ParseStream) -> Result<Self> {
+        if input.peek(syn::token::Brace) {
+            let content;
+            syn::braced!(content in input);
+            let mut entries = Vec::new();
+
+            while !content.is_empty() {
+                let key = if content.peek(LitStr) {
+                    JsonKey::Lit(content.parse()?)
+                } else if content.peek(syn::token::Paren) {
+                    let inner;
+                    syn::parenthesized!(inner in content);
+                    JsonKey::Expr(inner.parse()?)
+                } else {
+                    return Err(
+                        content.error("expected string literal or `(expr)` key in `json!` object")
+                    );
+                };
+
+                let _: Token![:] = content.parse()?;
+                let val: JsonAst = content.parse()?;
+                entries.push((key, val));
+
+                if content.peek(Token![,]) {
+                    let _: Token![,] = content.parse()?;
+                } else if !content.is_empty() {
+                    return Err(content.error("expected `,` or `}` in `json!` object"));
+                }
+            }
+
+            return Ok(JsonAst::Object(entries));
+        }
+
+        if input.peek(syn::token::Bracket) {
+            let content;
+            bracketed!(content in input);
+            let mut items = Vec::new();
+
+            while !content.is_empty() {
+                let val: JsonAst = content.parse()?;
+                items.push(val);
+
+                if content.peek(Token![,]) {
+                    let _: Token![,] = content.parse()?;
+                } else if !content.is_empty() {
+                    return Err(content.error("expected `,` or `]` in `json!` array"));
+                }
+            }
+
+            return Ok(JsonAst::Array(items));
+        }
+
+        if input.peek(Ident) {
+            let fork = input.fork();
+            if let Ok(ident) = fork.parse::<Ident>() {
+                if ident == "null" && (fork.is_empty() || fork.peek(Token![,])) {
+                    let _: Ident = input.parse()?;
+                    return Ok(JsonAst::Null);
+                }
+            }
+        }
+        if input.peek(syn::LitBool) {
+            let fork = input.fork();
+            if let Ok(b) = fork.parse::<syn::LitBool>() {
+                if fork.is_empty() || fork.peek(Token![,]) {
+                    let b: syn::LitBool = input.parse()?;
+                    return Ok(JsonAst::Bool(b.value));
+                }
+            }
+        }
+
+        Ok(JsonAst::Expr(input.parse::<syn::Expr>()?))
+    }
+}
+
+impl JsonAst {
+    fn into_tokens(self, crate_path: &Path) -> proc_macro2::TokenStream {
+        match self {
+            JsonAst::Null => quote!(#crate_path::__json::JsonValue::Null),
+            JsonAst::Bool(b) => quote!(#crate_path::__json::JsonValue::Bool(#b)),
+            JsonAst::Array(items) => {
+                if items.is_empty() {
+                    quote!(#crate_path::__json::JsonValue::Array(::std::vec::Vec::new()))
+                } else {
+                    let cap = items.len();
+                    let elems = items.into_iter().map(|it| it.into_tokens(crate_path));
+                    quote! {{
+                        let mut __arr = ::std::vec::Vec::with_capacity(#cap);
+                        #(__arr.push(#elems);)*
+                        #crate_path::__json::JsonValue::Array(__arr)
+                    }}
+                }
+            }
+            JsonAst::Object(entries) => {
+                if entries.is_empty() {
+                    quote!(#crate_path::__json::JsonValue::Object(::std::vec::Vec::new()))
+                } else {
+                    let cap = entries.len();
+                    let pushes = entries.into_iter().map(|(k, v)| {
+                        let v_ts = v.into_tokens(crate_path);
+                        let k_ts = match k {
+                            JsonKey::Lit(lit) => quote!(::std::string::String::from(#lit)),
+                            JsonKey::Expr(expr) => quote!(::std::string::String::from(#expr)),
+                        };
+                        quote!(__obj.push((#k_ts, #v_ts));)
+                    });
+                    quote! {{
+                        let mut __obj = ::std::vec::Vec::with_capacity(#cap);
+                        #(#pushes)*
+                        #crate_path::__json::JsonValue::Object(__obj)
+                    }}
+                }
+            }
+            JsonAst::Expr(expr) => {
+                quote!(#crate_path::__json::IntoJsonValue::into_json_value(#expr))
+            }
+        }
+    }
+}
+
+#[proc_macro]
+pub fn json(input: TokenStream) -> TokenStream {
+    let ast = match syn::parse::<JsonAst>(input) {
+        Ok(ast) => ast,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let crate_path = resolve_crate("http");
+    ast.into_tokens(&crate_path).into()
+}

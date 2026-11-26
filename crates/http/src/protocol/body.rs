@@ -23,7 +23,7 @@ mod json;
 mod multipart;
 
 pub(crate) use json::write_json_str;
-pub use json::{JsonValue, RawJson, ToJson};
+pub use json::{IntoJsonValue, JsonValue, ToJson};
 
 use crate::protocol::body::multipart::Multipart;
 use crate::server::Connection;

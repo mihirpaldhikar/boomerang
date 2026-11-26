@@ -28,7 +28,8 @@ mod response;
 mod status;
 mod stream;
 
-pub(crate) use body::{Body, JsonValue, write_json_str};
+pub(crate) use body::{Body, write_json_str};
+pub use body::{IntoJsonValue, JsonValue};
 pub(crate) use field_lines::FieldLines;
 pub use method::HttpMethod;
 pub(crate) use request::{BodyState, HttpParam, HttpRequest, HttpRequestError};
@@ -37,7 +38,7 @@ pub(crate) use response::{
     ResponseHook,
 };
 pub use status::HttpStatus;
+pub(crate) use stream::StreamPoll;
 pub use stream::{
     IntoBodyStream, StreamChunk, StreamClosed, StreamReceiver, StreamSender, stream_channel,
 };
-pub(crate) use stream::{StreamPoll};
