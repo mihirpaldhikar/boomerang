@@ -249,20 +249,277 @@ pub(crate) enum BodyState {
     Read(Body),
 }
 
+#[inline]
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpCidr {
+    V4 { net: u32, mask: u32 },
+    V6 { net: u128, mask: u128 },
+}
+
+impl IpCidr {
+    pub fn from_v4(addr: Ipv4Addr, prefix: u8) -> Option<Self> {
+        if prefix > 32 {
+            return None;
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            !0u32 << (32 - prefix)
+        };
+        Some(Self::V4 {
+            net: u32::from(addr) & mask,
+            mask,
+        })
+    }
+
+    pub fn from_v6(addr: Ipv6Addr, prefix: u8) -> Option<Self> {
+        if prefix > 128 {
+            return None;
+        }
+        let mask = if prefix == 0 {
+            0
+        } else {
+            !0u128 << (128 - prefix)
+        };
+        Some(Self::V6 {
+            net: u128::from(addr) & mask,
+            mask,
+        })
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some((ip_str, prefix_str)) = s.split_once('/') {
+            let prefix: u8 = prefix_str.parse().ok()?;
+            match normalize_ip(ip_str.parse().ok()?) {
+                IpAddr::V4(v4) => Self::from_v4(v4, prefix),
+                IpAddr::V6(v6) => Self::from_v6(v6, prefix),
+            }
+        } else {
+            match normalize_ip(s.parse().ok()?) {
+                IpAddr::V4(v4) => Self::from_v4(v4, 32),
+                IpAddr::V6(v6) => Self::from_v6(v6, 128),
+            }
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (*self, ip) {
+            (Self::V4 { net, mask }, IpAddr::V4(v4)) => (u32::from(v4) & mask) == net,
+            (Self::V6 { net, mask }, IpAddr::V6(v6)) => (u128::from(v6) & mask) == net,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyHeaderMode {
+    /// Checks `X-Forwarded-For` -> RFC 7239 `Forwarded` -> `X-Real-IP`
+    #[default]
+    Auto,
+    XForwardedFor,
+    Forwarded,
+    XRealIp,
+    CfConnectingIp,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxies {
+    cidrs: Vec<IpCidr>,
+    mode: ProxyHeaderMode,
+}
+
+impl TrustedProxies {
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    pub fn add_private_networks(&mut self) {
+        self.cidrs.extend([
+            IpCidr::from_v4(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
+            IpCidr::from_v4(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap(),
+            IpCidr::from_v4(Ipv4Addr::new(172, 16, 0, 0), 12).unwrap(),
+            IpCidr::from_v4(Ipv4Addr::new(192, 168, 0, 0), 16).unwrap(),
+            IpCidr::from_v4(Ipv4Addr::new(100, 64, 0, 0), 10).unwrap(),
+            IpCidr::from_v6(Ipv6Addr::LOCALHOST, 128).unwrap(),
+            IpCidr::from_v6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7).unwrap(),
+        ]);
+    }
+
+    pub fn push_cidr(&mut self, cidr: IpCidr) {
+        self.cidrs.push(cidr);
+    }
+
+    pub fn set_mode(&mut self, mode: ProxyHeaderMode) {
+        self.mode = mode;
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.cidrs.is_empty()
+    }
+
+    #[inline]
+    pub fn is_trusted(&self, ip: IpAddr) -> bool {
+        self.cidrs.iter().any(|c| c.contains(ip))
+    }
+}
+
+#[inline]
+fn parse_forwarded_ip(raw: &str) -> Option<IpAddr> {
+    let s = raw.trim().trim_matches('"').trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+
+    if let Some(after_open) = s.strip_prefix('[') {
+        let (inside, _) = after_open.split_once(']')?;
+        return inside
+            .parse::<Ipv6Addr>()
+            .ok()
+            .map(|v6| normalize_ip(IpAddr::V6(v6)));
+    }
+
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(normalize_ip(ip));
+    }
+
+    if let Some((left, _port)) = s.rsplit_once(':') {
+        if !left.contains(':') {
+            return left.parse::<Ipv4Addr>().ok().map(IpAddr::V4);
+        }
+    }
+
+    None
+}
+
+#[inline]
+fn peel_xff(xff: &str, trusted: &TrustedProxies, fallback: IpAddr) -> Option<IpAddr> {
+    let mut last_trusted: Option<IpAddr> = None;
+    let mut saw_any = false;
+    for part in xff.rsplit(',').take(16) {
+        let Some(ip) = parse_forwarded_ip(part) else {
+            break;
+        };
+        saw_any = true;
+        if !trusted.is_trusted(ip) {
+            return Some(ip);
+        }
+        last_trusted = Some(ip);
+    }
+    if saw_any {
+        Some(last_trusted.unwrap_or(fallback))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn peel_rfc7239_forwarded(hdr: &str, trusted: &TrustedProxies, fallback: IpAddr) -> Option<IpAddr> {
+    let mut last_trusted: Option<IpAddr> = None;
+    let mut saw_any = false;
+
+    for hop in hdr.rsplit(',').take(16) {
+        let for_val = hop.split(';').find_map(|param| {
+            let p = param.trim();
+            if p.len() >= 4 && p[..4].eq_ignore_ascii_case("for=") {
+                Some(&p[4..])
+            } else {
+                None
+            }
+        });
+        let Some(raw_ip) = for_val else {
+            break;
+        };
+        let Some(ip) = parse_forwarded_ip(raw_ip) else {
+            break;
+        };
+        saw_any = true;
+        if !trusted.is_trusted(ip) {
+            return Some(ip);
+        }
+        last_trusted = Some(ip);
+    }
+
+    if saw_any {
+        Some(last_trusted.unwrap_or(fallback))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn resolve_client_ip(
+    peer_ip: IpAddr,
+    field_lines: &FieldLines,
+    trusted: &TrustedProxies,
+) -> IpAddr {
+    if trusted.is_empty() || !trusted.is_trusted(peer_ip) {
+        return peer_ip;
+    }
+
+    match trusted.mode {
+        ProxyHeaderMode::Auto => {
+            if let Some(xff) = field_lines.get("x-forwarded-for") {
+                if let Some(ip) = peel_xff(xff, trusted, peer_ip) {
+                    return ip;
+                }
+            }
+            if let Some(fwd) = field_lines.get("forwarded") {
+                if let Some(ip) = peel_rfc7239_forwarded(fwd, trusted, peer_ip) {
+                    return ip;
+                }
+            }
+            if let Some(real_ip) = field_lines.get("x-real-ip") {
+                if let Some(ip) = parse_forwarded_ip(real_ip) {
+                    return ip;
+                }
+            }
+            peer_ip
+        }
+        ProxyHeaderMode::XForwardedFor => field_lines
+            .get("x-forwarded-for")
+            .and_then(|v| peel_xff(v, trusted, peer_ip))
+            .unwrap_or(peer_ip),
+        ProxyHeaderMode::Forwarded => field_lines
+            .get("forwarded")
+            .and_then(|v| peel_rfc7239_forwarded(v, trusted, peer_ip))
+            .unwrap_or(peer_ip),
+        ProxyHeaderMode::XRealIp => field_lines
+            .get("x-real-ip")
+            .and_then(parse_forwarded_ip)
+            .unwrap_or(peer_ip),
+        ProxyHeaderMode::CfConnectingIp => field_lines
+            .get("cf-connecting-ip")
+            .and_then(parse_forwarded_ip)
+            .unwrap_or(peer_ip),
+    }
+}
+
 pub(crate) struct HttpRequest {
-    client_ipv4_address: Option<Ipv4Addr>,
-    client_ipv6_address: Option<Ipv6Addr>,
+    peer_ip: IpAddr,
+    client_ip: IpAddr,
     http_version: Bytes,
     method: HttpMethod,
     pub(crate) route: String,
     pub(crate) field_lines: FieldLines,
     pub(crate) max_body_size: usize,
+    pub(crate) request_timeout: std::time::Duration,
     pub(crate) body_state: BodyState,
 
     pub(crate) path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
     pub(crate) query_params: OnceLock<Vec<(Arc<str>, Arc<str>)>>,
-
-    pub(crate) request_timeout: std::time::Duration,
 }
 
 #[inline]
@@ -317,6 +574,7 @@ impl HttpRequest {
         peer_addr: SocketAddr,
         max_body_size: usize,
         request_timeout: std::time::Duration,
+        trusted_proxies: &TrustedProxies,
         mut field_lines: FieldLines,
         mut route: String,
         mut path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
@@ -382,6 +640,8 @@ impl HttpRequest {
             (method, version)
         };
 
+        let peer_ip = normalize_ip(peer_addr.ip());
+
         let _ = field_lines.parse_into(&header_bytes[req_line_end + 1..]);
 
         let has_te = field_lines.get("transfer-encoding");
@@ -406,9 +666,11 @@ impl HttpRequest {
 
         path_params.clear();
 
+        let client_ip = resolve_client_ip(peer_ip, &field_lines, trusted_proxies);
+
         Ok(Self {
-            client_ipv4_address,
-            client_ipv6_address,
+            client_ip,
+            peer_ip,
             method,
             route,
             http_version,
@@ -425,13 +687,13 @@ impl HttpRequest {
     }
 
     #[inline]
-    pub(crate) fn client_ipv4_address(&self) -> Option<Ipv4Addr> {
-        self.client_ipv4_address
+    pub(crate) fn client_ip(&self) -> IpAddr {
+        self.client_ip
     }
 
     #[inline]
-    pub(crate) fn client_ipv6_address(&self) -> Option<Ipv6Addr> {
-        self.client_ipv6_address
+    pub(crate) fn peer_ip(&self) -> IpAddr {
+        self.peer_ip
     }
 
     #[inline]

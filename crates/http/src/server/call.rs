@@ -26,7 +26,7 @@ use crate::protocol::{
 use crate::server::connection::{Connection, WorkerScratch};
 use crate::server::{RequestId, RestartContext, RestartHandle};
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 pub struct HttpCall {
     pub(crate) connection: Connection,
@@ -88,12 +88,12 @@ impl HttpCall {
         self.connection.restart_handle.clone()
     }
 
-    pub fn client_ipv4_address(&self) -> Option<Ipv4Addr> {
-        self.request.client_ipv4_address()
+    pub fn client_ip(&self) -> IpAddr {
+        self.request.client_ip()
     }
 
-    pub fn client_ipv6_address(&self) -> Option<Ipv6Addr> {
-        self.request.client_ipv6_address()
+    pub fn peer_ip(&self) -> IpAddr {
+        self.request.peer_ip()
     }
 
     pub fn host(&self) -> Option<&str> {

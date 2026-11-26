@@ -22,7 +22,7 @@
 
 use crate::protocol::{
     Body, FieldLines, HttpRequest, HttpRequestError, HttpResponse, HttpResponseBodyInitialized,
-    HttpStatus,
+    HttpStatus, TrustedProxies,
 };
 use crate::server::RestartHandle;
 use crate::server::transport::Transport;
@@ -334,6 +334,7 @@ pub(crate) struct Connection {
     pub(crate) restart_handle: RestartHandle,
     has_written_response: bool,
     keep_alive: bool,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl Connection {
@@ -342,6 +343,7 @@ impl Connection {
         transport: Transport,
         keep_alive_header: Arc<[u8]>,
         restart_handle: RestartHandle,
+        trusted_proxies: Arc<TrustedProxies>,
     ) -> Self {
         Self {
             transport,
@@ -351,6 +353,7 @@ impl Connection {
             restart_handle,
             has_written_response: false,
             keep_alive: true,
+            trusted_proxies,
         }
     }
 
@@ -484,6 +487,7 @@ impl Connection {
                 peer_addr,
                 max_body_size,
                 request_timeout,
+                &self.trusted_proxies,
                 req_fields,
                 route_buf,
                 path_params,
@@ -521,6 +525,7 @@ impl Connection {
                         peer_addr,
                         max_body_size,
                         request_timeout,
+                        &self.trusted_proxies,
                         req_fields,
                         route_buf,
                         path_params,

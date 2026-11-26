@@ -29,14 +29,14 @@ pub mod static_files;
 mod tls;
 
 #[cfg(feature = "derive")]
-pub use http_macros::{route, static_files, json};
+pub use http_macros::{json, route, static_files};
 
 #[doc(hidden)]
 pub use bytes as __bytes;
 
 pub use protocol::{
-    HttpMethod, HttpStatus, IntoBodyStream, StreamChunk, StreamClosed, StreamReceiver,
-    StreamSender, stream_channel,
+    HttpMethod, HttpStatus, IntoBodyStream, IpCidr, ProxyHeaderMode, StreamChunk, StreamClosed,
+    StreamReceiver, StreamSender, TrustedProxies, stream_channel,
 };
 pub use router::{
     __register_route, MiddlewareHandler, RouteDefinition, RouteEntry, RouteHandler, SmallFuture,

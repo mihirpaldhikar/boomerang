@@ -29,6 +29,7 @@ mod transport;
 use crate::cors::Cors;
 use crate::protocol::{
     HttpMethod, HttpRequestError, HttpResponse, HttpResponseBodyUnInitialized, HttpStatus,
+    TrustedProxies,
 };
 use crate::router::Router;
 use crate::tls::{AcmeChallengeStore, TlsBackgroundTask, TlsConfigError};
@@ -371,6 +372,7 @@ pub struct HttpServer {
     restart_pre_hook_timeout: std::time::Duration,
     max_body_size: usize,
     exe_path: Option<std::path::PathBuf>,
+    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl HttpServer {
@@ -1099,6 +1101,7 @@ impl HttpServer {
             transport,
             self.keep_alive_header.clone(),
             restart_handle.clone(),
+            self.trusted_proxies.clone(),
         );
 
         let idle_sleep = tokio::time::sleep(self.keep_alive_timeout);

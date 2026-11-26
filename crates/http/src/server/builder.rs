@@ -20,16 +20,16 @@
  * SOFTWARE.
  */
 use crate::cors::Cors;
+use crate::protocol::TrustedProxies;
 use crate::router::Router;
+#[cfg(target_os = "linux")]
+use crate::server::prewarm_linux_fd_table;
 use crate::server::request_info::RequestInfo;
 use crate::server::{ActiveSet, HttpServer, HttpServerError, OnRequestComplete};
 use crate::tls::{AcmeChallengeStore, TlsConfig};
 use socket2::Socket;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
-
-#[cfg(target_os = "linux")]
-use crate::server::prewarm_linux_fd_table;
 
 pub struct HttpServerBuilder {
     port: u16,
@@ -43,6 +43,7 @@ pub struct HttpServerBuilder {
     restart_pre_hook_timeout: std::time::Duration,
     acme_webroot: Option<String>,
     acme_http_port: Option<u16>,
+    trusted_proxies: TrustedProxies,
 }
 
 impl HttpServerBuilder {
@@ -59,6 +60,7 @@ impl HttpServerBuilder {
             restart_pre_hook_timeout: std::time::Duration::from_secs(30),
             acme_webroot: None,
             acme_http_port: None,
+            trusted_proxies: TrustedProxies::none(),
         }
     }
 
@@ -113,6 +115,39 @@ impl HttpServerBuilder {
 
     pub fn restart_pre_hook_timeout(mut self, duration: std::time::Duration) -> Self {
         self.restart_pre_hook_timeout = duration;
+        self
+    }
+    /// Trust loopback and RFC 1918 / RFC 6598 / ULA private proxy networks
+    /// (e.g. local NGINX/Caddy, Docker, AWS ALB, DigitalOcean LB).
+    pub fn trust_private_proxies(mut self) -> Self {
+        self.trusted_proxies.add_private_networks();
+        self
+    }
+
+    /// Trust a single proxy IP or CIDR (e.g. `"10.0.0.5"` or `"173.245.48.0/20"`).
+    pub fn trust_proxy_cidr(mut self, cidr: &str) -> Self {
+        let parsed = crate::protocol::IpCidr::parse(cidr)
+            .unwrap_or_else(|| panic!("invalid trusted proxy CIDR: '{cidr}'"));
+        self.trusted_proxies.push_cidr(parsed);
+        self
+    }
+
+    /// Trust a list/slice of proxy IPs or CIDRs (e.g. Cloudflare edge IP ranges).
+    pub fn trust_proxy_cidrs<'a, I>(mut self, cidrs: I) -> Self
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        for cidr in cidrs {
+            let parsed = crate::protocol::IpCidr::parse(cidr)
+                .unwrap_or_else(|| panic!("invalid trusted proxy CIDR: '{cidr}'"));
+            self.trusted_proxies.push_cidr(parsed);
+        }
+        self
+    }
+
+    /// Select which proxy header to resolve `client_ip()` from (defaults to `Auto`).
+    pub fn proxy_header_mode(mut self, mode: crate::protocol::ProxyHeaderMode) -> Self {
+        self.trusted_proxies.set_mode(mode);
         self
     }
 
@@ -183,6 +218,7 @@ impl HttpServerBuilder {
             acme_challenges,
             acme_webroot: self.acme_webroot,
             exe_path,
+            trusted_proxies: Arc::new(self.trusted_proxies),
         })
     }
 }
