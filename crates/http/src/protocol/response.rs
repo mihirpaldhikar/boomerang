@@ -212,13 +212,13 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
         producer: F,
     ) -> HttpResponse<HttpResponseBodyInitialized>
     where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
+        Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
         C: Into<Cow<'static, str>>,
     {
         let (tx, rx) = crate::protocol::stream::stream_channel(16);
-        let handle = tokio::spawn(async move {
+        let handle = tokio::task::spawn_local(async move {
             let err_tx = tx.clone();
             if let Err(err) = producer(tx).await {
                 err_tx.apply_error(err).await;
@@ -239,8 +239,8 @@ impl HttpResponse<HttpResponseBodyUnInitialized> {
 
     pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponse<HttpResponseBodyInitialized>
     where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
+        Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
     {
         self.__add_header_internal("cache-control", "no-cache")
@@ -622,8 +622,8 @@ impl<'a> HttpResponseInit<'a> {
 
     pub fn stream_with<F, Fut, E, C>(self, content_type: C, producer: F) -> HttpResponseReady<'a>
     where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
+        Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
         C: Into<Cow<'static, str>>,
     {
@@ -635,8 +635,8 @@ impl<'a> HttpResponseInit<'a> {
 
     pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponseReady<'a>
     where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
+        Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
     {
         HttpResponseReady {
