@@ -23,6 +23,7 @@ mod active_set;
 mod builder;
 mod call;
 mod connection;
+mod per_core;
 mod request_info;
 mod transport;
 
@@ -32,11 +33,13 @@ use crate::protocol::{
     TrustedProxies,
 };
 use crate::router::Router;
+use crate::server::per_core::set_current_worker_id;
 use crate::tls::{AcmeChallengeStore, TlsBackgroundTask, TlsConfigError};
 use active_set::ActiveSet;
 use builder::HttpServerBuilder;
 use bytes::Bytes;
 pub use call::HttpCall;
+pub use per_core::PerCore;
 pub(crate) use connection::{Connection, WorkerScratch};
 use request_info::RequestInfo;
 use std::cell::Cell;
@@ -344,6 +347,27 @@ fn prewarm_linux_fd_table() {
             if dup_fd >= 0 {
                 let _owned = OwnedFd::from_raw_fd(dup_fd);
             }
+        }
+    }
+}
+
+pub(crate) struct WorkerLocalState {
+    pub(crate) server: Arc<HttpServer>,
+    pub(crate) keep_alive_header: Rc<[u8]>,
+    pub(crate) trusted_proxies: Rc<TrustedProxies>,
+    pub(crate) restart_handle: Rc<RestartHandle>,
+}
+
+impl WorkerLocalState {
+    fn new(server: Arc<HttpServer>, restart_handle: RestartHandle) -> Self {
+        let keep_alive_header = Rc::from(&*server.keep_alive_header);
+        let trusted_proxies = Rc::new((*server.trusted_proxies).clone());
+        let restart_handle = Rc::new(restart_handle);
+        Self {
+            server,
+            keep_alive_header,
+            trusted_proxies,
+            restart_handle,
         }
     }
 }
@@ -716,10 +740,12 @@ impl HttpServer {
                 std::thread::Builder::new()
                     .name(format!("http-worker-{idx}"))
                     .spawn(move || {
-                        // Pin OS thread BEFORE creating LocalRuntime so any spawn_blocking
-                        // threads won't inherit pinning onto this hot I/O core.
                         pin_current_thread_to_cpu(cpu_id);
                         init_worker_request_id_gen(idx);
+                        set_current_worker_id(idx);
+
+                        let local_state =
+                            std::rc::Rc::new(WorkerLocalState::new(server_clone, restart_handle));
 
                         let rt = build_worker_local_runtime();
                         rt.block_on(async move {
@@ -746,13 +772,12 @@ impl HttpServer {
                                                 Poll::Ready(Ok((stream, peer_addr))) => {
                                                     let _ = stream.set_nodelay(true);
 
-                                                    let srv = server_clone.clone();
-                                                    let rh = restart_handle.clone();
+                                                    let state = local_state.clone();
 
                                                     tokio::task::spawn_local(async move {
                                                         let _guard = LocalTaskGuard::new();
 
-                                                        let transport = match &srv.tls {
+                                                        let transport = match &state.server.tls {
                                                             None => Transport::from_tcp(
                                                                 stream, peer_addr,
                                                             ),
@@ -769,7 +794,10 @@ impl HttpServer {
                                                             }
                                                         };
 
-                                                        srv.handle_connection(transport, &rh).await;
+                                                        HttpServer::handle_connection(
+                                                            transport, state,
+                                                        )
+                                                        .await;
                                                     });
 
                                                     accepted += 1;
@@ -799,9 +827,7 @@ impl HttpServer {
                                 }
                             }
 
-                            // Drop listener immediately so kernel stops queuing new SYNs here
                             drop(listener);
-
                             LocalTaskGuard::wait_for_zero().await;
                         });
 
@@ -813,9 +839,7 @@ impl HttpServer {
             drain_barrier
         }
 
-        // Non-Linux (macOS, Windows, BSD without SO_REUSEPORT_LB):
-        // Bind 1 listener and distribute accepted sockets round-robin across `worker_count`
-        // independent LocalRuntime threads so all CPU cores are utilized.
+        // Non-Linux (macOS, Windows, BSD without SO_REUSEPORT_LB)
         #[cfg(not(target_os = "linux"))]
         {
             let _ = allowed_cpus;
@@ -837,6 +861,11 @@ impl HttpServer {
                     .name(format!("http-worker-{idx}"))
                     .spawn(move || {
                         pin_current_thread_to_cpu(None);
+                        init_worker_request_id_gen(idx);
+                        set_current_worker_id(idx);
+
+                        let local_state =
+                             Rc::new(WorkerLocalState::new(server_clone, restart_handle));
 
                         let rt = build_worker_local_runtime();
                         rt.block_on(async move {
@@ -856,13 +885,12 @@ impl HttpServer {
                                             continue;
                                         };
 
-                                        let srv = server_clone.clone();
-                                        let rh = restart_handle.clone();
+                                        let state = local_state.clone();
 
                                         tokio::task::spawn_local(async move {
                                             let _guard = LocalTaskGuard::new();
 
-                                            let transport = match &srv.tls {
+                                            let transport = match &state.server.tls {
                                                 None => Transport::from_tcp(stream, peer_addr),
                                                 Some(acceptor) => match acceptor.accept(stream).await {
                                                     Ok(tls_stream) => Transport::from_tls(tls_stream, peer_addr),
@@ -870,11 +898,7 @@ impl HttpServer {
                                                 },
                                             };
 
-                                            srv.handle_connection(
-                                                transport,
-                                                &rh,
-                                            )
-                                            .await;
+                                            HttpServer::handle_connection(transport, state).await;
                                         });
                                     }
                                 }
@@ -887,13 +911,12 @@ impl HttpServer {
                                     continue;
                                 };
 
-                                let srv = server_clone.clone();
-                                let rh = restart_handle.clone();
+                                let state = local_state.clone();
 
                                 tokio::task::spawn_local(async move {
                                     let _guard = LocalTaskGuard::new();
 
-                                    let transport = match &srv.tls {
+                                    let transport = match &state.server.tls {
                                         None => Transport::from_tcp(stream, peer_addr),
                                         Some(acceptor) => match acceptor.accept(stream).await {
                                             Ok(tls_stream) => Transport::from_tls(tls_stream, peer_addr),
@@ -901,7 +924,7 @@ impl HttpServer {
                                         },
                                     };
 
-                                    srv.handle_connection(transport, &rh).await;
+                                    HttpServer::handle_connection(transport, state).await;
                                 });
                             }
 
@@ -921,7 +944,6 @@ impl HttpServer {
                 std::thread::Builder::new()
                     .name(format!("http-acceptor-{idx}"))
                     .spawn(move || {
-                        // Keeps the acceptor on macOS Performance cores as well
                         pin_current_thread_to_cpu(None);
 
                         let rt = build_worker_local_runtime();
@@ -1096,22 +1118,19 @@ impl HttpServer {
         }
     }
 
-    async fn handle_connection(&self, transport: Transport, restart_handle: &RestartHandle) {
-        let mut connection = Connection::with_server_state(
-            transport,
-            self.keep_alive_header.clone(),
-            restart_handle.clone(),
-            self.trusted_proxies.clone(),
-        );
-
-        let idle_sleep = tokio::time::sleep(self.keep_alive_timeout);
+    async fn handle_connection(transport: Transport, state: std::rc::Rc<WorkerLocalState>) {
+        let srv_state = state.clone();
+        let idle_sleep = tokio::time::sleep(srv_state.server.keep_alive_timeout);
         tokio::pin!(idle_sleep);
         let mut last_timer_sec = connection::coarse_elapsed_secs();
+
+        let mut connection = Connection::with_worker_state(transport, state);
 
         loop {
             let request_id = next_request_id();
 
-            match self
+            match srv_state
+                .server
                 .handle_single_request(
                     connection,
                     request_id,

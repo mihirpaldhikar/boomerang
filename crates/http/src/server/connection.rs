@@ -22,9 +22,8 @@
 
 use crate::protocol::{
     Body, FieldLines, HttpRequest, HttpRequestError, HttpResponse, HttpResponseBodyInitialized,
-    HttpStatus, TrustedProxies,
+    HttpStatus,
 };
-use crate::server::RestartHandle;
 use crate::server::transport::Transport;
 use bytes::BytesMut;
 use std::cell::RefCell;
@@ -330,30 +329,24 @@ pub(crate) struct Connection {
     pub(crate) transport: Transport,
     pub(crate) reader: BytesMut,
     pipeline_buf: Vec<u8>,
-    keep_alive_header: Arc<[u8]>,
-    pub(crate) restart_handle: RestartHandle,
+    pub(crate) state: std::rc::Rc<crate::server::WorkerLocalState>,
     has_written_response: bool,
     keep_alive: bool,
-    trusted_proxies: Arc<TrustedProxies>,
 }
 
 impl Connection {
     #[inline]
-    pub(crate) fn with_server_state(
+    pub(crate) fn with_worker_state(
         transport: Transport,
-        keep_alive_header: Arc<[u8]>,
-        restart_handle: RestartHandle,
-        trusted_proxies: Arc<TrustedProxies>,
+        state: std::rc::Rc<crate::server::WorkerLocalState>,
     ) -> Self {
         Self {
             transport,
             reader: BytesMut::new(),
             pipeline_buf: Vec::new(),
-            keep_alive_header,
-            restart_handle,
+            state,
             has_written_response: false,
             keep_alive: true,
-            trusted_proxies,
         }
     }
 
@@ -487,7 +480,7 @@ impl Connection {
                 peer_addr,
                 max_body_size,
                 request_timeout,
-                &self.trusted_proxies,
+                &self.state.trusted_proxies,
                 req_fields,
                 route_buf,
                 path_params,
@@ -525,7 +518,7 @@ impl Connection {
                         peer_addr,
                         max_body_size,
                         request_timeout,
-                        &self.trusted_proxies,
+                        &self.state.trusted_proxies,
                         req_fields,
                         route_buf,
                         path_params,
@@ -580,7 +573,7 @@ impl Connection {
         header_buf.extend_from_slice(b"\r\n");
 
         if self.keep_alive {
-            header_buf.extend_from_slice(&self.keep_alive_header);
+            header_buf.extend_from_slice(&self.state.keep_alive_header);
         } else {
             header_buf.extend_from_slice(b"connection: close\r\n");
         }

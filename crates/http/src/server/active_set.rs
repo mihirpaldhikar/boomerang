@@ -41,7 +41,7 @@ fn current_shard_idx() -> usize {
     THREAD_SHARD_IDX.with(|&idx| idx)
 }
 
-#[repr(align(64))]
+#[repr(align(128))]
 struct Shard<Id, Info> {
     count: AtomicUsize,
     map: Option<Mutex<HashMap<Id, Info>>>,
@@ -52,7 +52,6 @@ pub struct ActiveSet<Id, Info> {
 }
 
 struct Inner<Id, Info> {
-    total_count: AtomicUsize,
     empty_notify: Notify,
     shards: Box<[Shard<Id, Info>]>,
 }
@@ -101,7 +100,6 @@ where
 
         Self {
             inner: Arc::new(Inner {
-                total_count: AtomicUsize::new(0),
                 empty_notify: Notify::new(),
                 shards,
             }),
@@ -112,7 +110,6 @@ where
         let shard_idx = current_shard_idx();
         let shard = &self.inner.shards[shard_idx];
 
-        self.inner.total_count.fetch_add(1, Ordering::Relaxed);
         shard.count.fetch_add(1, Ordering::Relaxed);
 
         if let Some(map) = &shard.map {
@@ -129,7 +126,11 @@ where
     }
 
     pub fn len(&self) -> usize {
-        self.inner.total_count.load(Ordering::Relaxed)
+        self.inner
+            .shards
+            .iter()
+            .map(|s| s.count.load(Ordering::Relaxed))
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -193,7 +194,12 @@ where
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if self.inner.total_count.load(Ordering::Acquire) == 0 {
+            if self
+                .inner
+                .shards
+                .iter()
+                .all(|s| s.count.load(Ordering::Acquire) == 0)
+            {
                 return;
             }
 
@@ -255,8 +261,7 @@ where
         }
         shard.count.fetch_sub(1, Ordering::Relaxed);
 
-        let prev = self.inner.total_count.fetch_sub(1, Ordering::Release);
-        debug_assert!(prev > 0, "count underflow — double-drop of ActiveGuard");
+        let prev = shard.count.fetch_sub(1, Ordering::Release);
         if prev == 1 {
             self.inner.empty_notify.notify_waiters();
         }

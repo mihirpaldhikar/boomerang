@@ -81,11 +81,14 @@ impl HttpCall {
         F: FnOnce(RestartContext) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.connection.restart_handle.restart(force, pre_hook);
+        self.connection
+            .state
+            .restart_handle
+            .restart(force, pre_hook);
     }
 
     pub fn restart_handle(&self) -> RestartHandle {
-        self.connection.restart_handle.clone()
+        (*self.connection.state.restart_handle).clone()
     }
 
     pub fn client_ip(&self) -> IpAddr {

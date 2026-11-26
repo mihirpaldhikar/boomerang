@@ -579,14 +579,6 @@ impl HttpRequest {
         mut route: String,
         mut path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
     ) -> Result<Self, HttpRequestError> {
-        let (client_ipv4_address, client_ipv6_address) = match peer_addr.ip() {
-            IpAddr::V4(ip) => (Some(ip), None),
-            IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-                Some(v4) => (Some(v4), None),
-                None => (None, Some(ip)),
-            },
-        };
-
         let req_line_end = memchr::memchr(b'\n', &header_bytes).ok_or_else(|| {
             HttpRequestError::RequestLineParsingFailed("Missing request line".into())
         })?;
