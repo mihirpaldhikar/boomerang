@@ -19,8 +19,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-
 use bytes::Bytes;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Index, IndexMut};
@@ -156,12 +156,170 @@ fn write_i64(n: i64, out: &mut Vec<u8>) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsonRef<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Uint(u64),
+    Float(f64),
+    String(Cow<'a, str>),
+    Array(Vec<JsonRef<'a>>),
+    Object(Vec<(Cow<'a, str>, JsonRef<'a>)>),
+}
+
+static NULL_REF: JsonRef<'static> = JsonRef::Null;
+
+impl<'a> JsonRef<'a> {
+    pub fn parse(input: &'a [u8]) -> Result<Self, JsonError> {
+        let mut parser = JsonParser { input, pos: 0 };
+        let val = parser.parse_value(0)?;
+        parser.skip_ws();
+        if parser.pos != parser.input.len() {
+            return Err(JsonError::TrailingCharacters);
+        }
+        Ok(val)
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        if let Self::Bool(b) = self {
+            Some(*b)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Int(n) => Some(*n),
+            Self::Uint(n) if *n <= i64::MAX as u64 => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Uint(n) => Some(*n),
+            Self::Int(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float(f) => Some(*f),
+            Self::Int(n) => Some(*n as f64),
+            Self::Uint(n) => Some(*n as f64),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        if let Self::String(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[JsonRef<'a>]> {
+        if let Self::Array(a) = self {
+            Some(a)
+        } else {
+            None
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&[(Cow<'a, str>, JsonRef<'a>)]> {
+        if let Self::Object(o) = self {
+            Some(o)
+        } else {
+            None
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&JsonRef<'a>> {
+        match self {
+            Self::Object(entries) => entries
+                .iter()
+                .rev()
+                .find(|(k, _)| &**k == key)
+                .map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn into_owned(self) -> JsonValue {
+        match self {
+            Self::Null => JsonValue::Null,
+            Self::Bool(b) => JsonValue::Bool(b),
+            Self::Int(n) => JsonValue::Int(n),
+            Self::Uint(n) => JsonValue::Uint(n),
+            Self::Float(f) => JsonValue::Float(f),
+            Self::String(s) => JsonValue::String(s.into_owned()),
+            Self::Array(a) => JsonValue::Array(a.into_iter().map(Self::into_owned).collect()),
+            Self::Object(o) => JsonValue::Object(
+                o.into_iter()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl<'a> Index<&str> for JsonRef<'a> {
+    type Output = JsonRef<'a>;
+    fn index(&self, key: &str) -> &Self::Output {
+        self.get(key).unwrap_or(&NULL_REF)
+    }
+}
+
+impl<'a> Index<usize> for JsonRef<'a> {
+    type Output = JsonRef<'a>;
+    fn index(&self, i: usize) -> &Self::Output {
+        match self {
+            Self::Array(a) => a.get(i).unwrap_or(&NULL_REF),
+            _ => &NULL_REF,
+        }
+    }
+}
+
 pub trait ToJson {
     fn write_json(&self, out: &mut Vec<u8>);
 
     #[inline]
     fn size_hint(&self) -> usize {
         128
+    }
+}
+
+impl ToJson for JsonRef<'_> {
+    fn write_json(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.extend_from_slice(b"null"),
+            Self::Bool(b) => b.write_json(out),
+            Self::Int(n) => write_i64(*n, out),
+            Self::Uint(n) => write_u64(*n, out),
+            Self::Float(f) => f.write_json(out),
+            Self::String(s) => write_json_str(s, out),
+            Self::Array(a) => a.write_json(out),
+            Self::Object(entries) => {
+                out.push(b'{');
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write_json_str(k, out);
+                    out.push(b':');
+                    v.write_json(out);
+                }
+                out.push(b'}');
+            }
+        }
     }
 }
 
@@ -431,13 +589,7 @@ impl JsonValue {
     }
 
     pub fn parse(input: &[u8]) -> Result<Self, JsonError> {
-        let mut parser = JsonParser { input, pos: 0 };
-        let val = parser.parse_value(0)?;
-        parser.skip_ws();
-        if parser.pos != parser.input.len() {
-            return Err(JsonError::TrailingCharacters);
-        }
-        Ok(val)
+        JsonRef::parse(input).map(JsonRef::into_owned)
     }
 }
 
@@ -647,7 +799,7 @@ impl<'a> JsonParser<'a> {
         self.input.get(self.pos).copied()
     }
 
-    fn parse_value(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+    fn parse_value(&mut self, depth: usize) -> Result<JsonRef<'a>, JsonError> {
         if depth > MAX_PARSE_DEPTH {
             return Err(JsonError::DepthLimitExceeded);
         }
@@ -657,7 +809,7 @@ impl<'a> JsonParser<'a> {
             b'n' => {
                 if self.input[self.pos..].starts_with(b"null") {
                     self.pos += 4;
-                    Ok(JsonValue::Null)
+                    Ok(JsonRef::Null)
                 } else {
                     Err(JsonError::UnexpectedToken)
                 }
@@ -665,7 +817,7 @@ impl<'a> JsonParser<'a> {
             b't' => {
                 if self.input[self.pos..].starts_with(b"true") {
                     self.pos += 4;
-                    Ok(JsonValue::Bool(true))
+                    Ok(JsonRef::Bool(true))
                 } else {
                     Err(JsonError::UnexpectedToken)
                 }
@@ -673,12 +825,12 @@ impl<'a> JsonParser<'a> {
             b'f' => {
                 if self.input[self.pos..].starts_with(b"false") {
                     self.pos += 5;
-                    Ok(JsonValue::Bool(false))
+                    Ok(JsonRef::Bool(false))
                 } else {
                     Err(JsonError::UnexpectedToken)
                 }
             }
-            b'"' => self.parse_string().map(JsonValue::String),
+            b'"' => self.parse_string().map(JsonRef::String),
             b'[' => self.parse_array(depth + 1),
             b'{' => self.parse_object(depth + 1),
             b'-' | b'0'..=b'9' => self.parse_number(),
@@ -686,46 +838,43 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_string(&mut self) -> Result<String, JsonError> {
+    fn parse_string(&mut self) -> Result<Cow<'a, str>, JsonError> {
+        let input = self.input;
         self.pos += 1;
         let start = self.pos;
 
-        loop {
-            let rel = memchr::memchr2(b'"', b'\\', &self.input[self.pos..])
-                .ok_or(JsonError::UnexpectedEof)?;
-            let idx = self.pos + rel;
+        let rel = memchr::memchr2(b'"', b'\\', &input[start..]).ok_or(JsonError::UnexpectedEof)?;
+        let idx = start + rel;
 
-            if self.input[self.pos..idx].iter().any(|&c| c < 0x20) {
+        if input[idx] == b'"' {
+            let raw = &input[start..idx];
+            if raw.iter().any(|&c| c < 0x20) {
                 return Err(JsonError::InvalidString);
             }
-
-            if self.input[idx] == b'"' {
-                let s = std::str::from_utf8(&self.input[start..idx])
-                    .map_err(|_| JsonError::InvalidString)?
-                    .to_owned();
-                self.pos = idx + 1;
-                return Ok(s);
-            } else {
-                break;
-            }
+            let s = std::str::from_utf8(raw).map_err(|_| JsonError::InvalidString)?;
+            self.pos = idx + 1;
+            return Ok(Cow::Borrowed(s));
         }
 
-        let mut out = String::new();
         self.pos = start;
+        self.parse_string_escaped().map(Cow::Owned)
+    }
 
+    fn parse_string_escaped(&mut self) -> Result<String, JsonError> {
+        let input = self.input;
+        let mut out = String::new();
         loop {
-            let rel = memchr::memchr2(b'"', b'\\', &self.input[self.pos..])
-                .ok_or(JsonError::UnexpectedEof)?;
+            let rel =
+                memchr::memchr2(b'"', b'\\', &input[self.pos..]).ok_or(JsonError::UnexpectedEof)?;
             let idx = self.pos + rel;
 
-            let chunk = &self.input[self.pos..idx];
+            let chunk = &input[self.pos..idx];
             if chunk.iter().any(|&c| c < 0x20) {
                 return Err(JsonError::InvalidString);
             }
-            let s = std::str::from_utf8(chunk).map_err(|_| JsonError::InvalidString)?;
-            out.push_str(s);
+            out.push_str(std::str::from_utf8(chunk).map_err(|_| JsonError::InvalidString)?);
 
-            if self.input[idx] == b'"' {
+            if input[idx] == b'"' {
                 self.pos = idx + 1;
                 return Ok(out);
             }
@@ -745,7 +894,7 @@ impl<'a> JsonParser<'a> {
                 b'u' => {
                     let code = self.parse_hex4()?;
                     if (0xD800..=0xDBFF).contains(&code) {
-                        if !self.input[self.pos..].starts_with(b"\\u") {
+                        if !input[self.pos..].starts_with(b"\\u") {
                             return Err(JsonError::InvalidUnicodeEscape);
                         }
                         self.pos += 2;
@@ -754,14 +903,13 @@ impl<'a> JsonParser<'a> {
                             return Err(JsonError::InvalidUnicodeEscape);
                         }
                         let cp = 0x10000 + (((code as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-                        let ch = char::from_u32(cp).ok_or(JsonError::InvalidUnicodeEscape)?;
-                        out.push(ch);
+                        out.push(char::from_u32(cp).ok_or(JsonError::InvalidUnicodeEscape)?);
                     } else if (0xDC00..=0xDFFF).contains(&code) {
                         return Err(JsonError::InvalidUnicodeEscape);
                     } else {
-                        let ch =
-                            char::from_u32(code as u32).ok_or(JsonError::InvalidUnicodeEscape)?;
-                        out.push(ch);
+                        out.push(
+                            char::from_u32(code as u32).ok_or(JsonError::InvalidUnicodeEscape)?,
+                        );
                     }
                 }
                 _ => return Err(JsonError::InvalidString),
@@ -787,7 +935,7 @@ impl<'a> JsonParser<'a> {
         Ok(val)
     }
 
-    fn parse_number(&mut self) -> Result<JsonValue, JsonError> {
+    fn parse_number(&mut self) -> Result<JsonRef<'a>, JsonError> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
@@ -840,29 +988,29 @@ impl<'a> JsonParser<'a> {
             if !f.is_finite() {
                 return Err(JsonError::InvalidNumber);
             }
-            Ok(JsonValue::Float(f))
+            Ok(JsonRef::Float(f))
         } else if num_str.starts_with('-') {
             if let Ok(n) = num_str.parse::<i64>() {
-                Ok(JsonValue::Int(n))
+                Ok(JsonRef::Int(n))
             } else {
                 let f: f64 = num_str.parse().map_err(|_| JsonError::InvalidNumber)?;
-                Ok(JsonValue::Float(f))
+                Ok(JsonRef::Float(f))
             }
         } else if let Ok(n) = num_str.parse::<u64>() {
-            Ok(JsonValue::Uint(n))
+            Ok(JsonRef::Uint(n))
         } else {
             let f: f64 = num_str.parse().map_err(|_| JsonError::InvalidNumber)?;
-            Ok(JsonValue::Float(f))
+            Ok(JsonRef::Float(f))
         }
     }
 
-    fn parse_array(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+    fn parse_array(&mut self, depth: usize) -> Result<JsonRef<'a>, JsonError> {
         self.pos += 1;
         self.skip_ws();
         let mut arr = Vec::new();
         if self.peek() == Some(b']') {
             self.pos += 1;
-            return Ok(JsonValue::Array(arr));
+            return Ok(JsonRef::Array(arr));
         }
 
         loop {
@@ -872,20 +1020,20 @@ impl<'a> JsonParser<'a> {
                 Some(b',') => self.pos += 1,
                 Some(b']') => {
                     self.pos += 1;
-                    return Ok(JsonValue::Array(arr));
+                    return Ok(JsonRef::Array(arr));
                 }
                 _ => return Err(JsonError::UnexpectedToken),
             }
         }
     }
 
-    fn parse_object(&mut self, depth: usize) -> Result<JsonValue, JsonError> {
+    fn parse_object(&mut self, depth: usize) -> Result<JsonRef<'a>, JsonError> {
         self.pos += 1;
         self.skip_ws();
         let mut obj = Vec::new();
         if self.peek() == Some(b'}') {
             self.pos += 1;
-            return Ok(JsonValue::Object(obj));
+            return Ok(JsonRef::Object(obj));
         }
 
         loop {
@@ -906,7 +1054,7 @@ impl<'a> JsonParser<'a> {
                 Some(b',') => self.pos += 1,
                 Some(b'}') => {
                     self.pos += 1;
-                    return Ok(JsonValue::Object(obj));
+                    return Ok(JsonRef::Object(obj));
                 }
                 _ => return Err(JsonError::UnexpectedToken),
             }

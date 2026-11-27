@@ -25,11 +25,12 @@ mod multipart;
 pub(crate) use json::write_json_str;
 pub use json::{IntoJsonValue, JsonValue, ToJson};
 
+use crate::HttpStatus;
+use crate::protocol::body::json::{JsonRef, RawJson};
 use crate::protocol::body::multipart::Multipart;
 use crate::server::Connection;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
-use crate::protocol::body::json::RawJson;
 
 static OCTET_STREAM: &[u8] = b"application/octet-stream";
 
@@ -73,10 +74,28 @@ impl<'a> BodyRef<'a> {
             .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
     }
 
-    pub fn as_json(&self) -> Option<JsonValue> {
-        self.is_type("application/json")
-            .then(|| JsonValue::parse(self.bytes).ok())
-            .flatten()
+    fn media_type(&self) -> Option<&'a str> {
+        self.content_type
+            .map(|ct| ct.split(';').next().unwrap_or("").trim())
+    }
+
+    fn is_json(&self) -> bool {
+        self.media_type().is_some_and(|m| {
+            let b = m.as_bytes();
+            m.eq_ignore_ascii_case("application/json")
+                || (b.len() > 5 && b[b.len() - 5..].eq_ignore_ascii_case(b"+json"))
+        })
+    }
+
+    pub fn as_json(&self) -> Option<JsonRef<'a>> {
+        self.json().ok()
+    }
+
+    pub fn json(&self) -> Result<JsonRef<'a>, BodyError> {
+        if !self.is_type("application/json") {
+            return Err(BodyError::WrongContentType);
+        }
+        JsonRef::parse(self.bytes).map_err(|_| BodyError::Malformed("invalid JSON"))
     }
 
     pub fn as_multipart(&self) -> Option<Multipart> {
@@ -121,6 +140,20 @@ pub enum BodyError {
     Malformed(&'static str),
     #[error("IO err: {0}")]
     Io(#[from] std::io::Error),
+    #[error("wrong content type")]
+    WrongContentType,
+}
+
+impl BodyError {
+    pub fn status(&self) -> HttpStatus {
+        match self {
+            Self::TooLarge => HttpStatus::ContentTooLarge,
+            Self::Timeout => HttpStatus::RequestTimeout,
+            Self::WrongContentType => HttpStatus::UnsupportedMediaType,
+            Self::Busy | Self::Consumed => HttpStatus::InternalServerError,
+            _ => HttpStatus::BadRequest,
+        }
+    }
 }
 
 pub enum Body {
@@ -162,13 +195,6 @@ impl From<RawJson> for Body {
 }
 
 impl Body {
-    pub(crate) fn from(bytes: &Bytes, content_type: Option<String>) -> Self {
-        Self::Bytes {
-            bytes: bytes.clone(),
-            content_type,
-        }
-    }
-
     pub(crate) fn from_stream<R>(
         reader: R,
         content_length: u64,
