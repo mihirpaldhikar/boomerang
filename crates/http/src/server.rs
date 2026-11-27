@@ -39,8 +39,8 @@ use active_set::ActiveSet;
 use builder::HttpServerBuilder;
 use bytes::Bytes;
 pub use call::HttpCall;
-pub use per_core::PerCore;
 pub(crate) use connection::{Connection, WorkerScratch};
+pub use per_core::PerCore;
 use request_info::RequestInfo;
 use std::cell::Cell;
 use std::net::{SocketAddr, TcpListener};
@@ -865,7 +865,7 @@ impl HttpServer {
                         set_current_worker_id(idx);
 
                         let local_state =
-                             Rc::new(WorkerLocalState::new(server_clone, restart_handle));
+                            Rc::new(WorkerLocalState::new(server_clone, restart_handle));
 
                         let rt = build_worker_local_runtime();
                         rt.block_on(async move {
@@ -1195,7 +1195,7 @@ impl HttpServer {
             .map(|v| !v.eq_ignore_ascii_case("close"))
             .unwrap_or(true);
 
-        call.connection.set_keep_alive(keep_alive);
+        call.connection.get_mut().set_keep_alive(keep_alive);
 
         if let Some(cors) = &self.cors {
             if *call.method() == HttpMethod::OPTIONS {
@@ -1303,7 +1303,7 @@ impl HttpServer {
                         .add_header("allow", allow);
                 }
 
-                let _ = call.connection.write_response(resp.empty()).await;
+                let _ = call.connection.get_mut().write_response(resp.empty()).await;
                 return self.finish(call, keep_alive).await;
             }
         };
@@ -1341,12 +1341,14 @@ impl HttpServer {
                 call.request.field_lines,
                 call.request.route,
                 call.request.path_params,
-                call.extras,
+                call.extras.into_inner(),
             );
-            call.connection.recycle_reader_if_empty();
-            Some(call.connection)
+            let mut conn = call.connection.into_inner();
+            conn.recycle_reader_if_empty();
+            Some(conn)
         } else {
-            let _ = call.connection.shutdown().await;
+            let mut conn = call.connection.into_inner();
+            let _ = conn.shutdown().await;
             None
         }
     }

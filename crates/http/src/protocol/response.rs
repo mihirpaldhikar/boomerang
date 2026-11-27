@@ -28,6 +28,7 @@ use crate::server::RequestId;
 use crate::server::{Connection, WorkerScratch};
 use bytes::Bytes;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
 
@@ -510,7 +511,7 @@ impl<State> HttpResponse<State> {
 }
 
 pub struct HttpResponseInit<'a> {
-    pub(crate) connection: &'a mut Connection,
+    pub(crate) connection: &'a RefCell<Connection>,
     pub(crate) response: HttpResponse<HttpResponseBodyUnInitialized>,
 }
 
@@ -653,7 +654,7 @@ impl<'a> HttpResponseInit<'a> {
 }
 
 pub struct HttpResponseReady<'a> {
-    pub(crate) connection: &'a mut Connection,
+    pub(crate) connection: &'a RefCell<Connection>,
     pub(crate) response: HttpResponse<HttpResponseBodyInitialized>,
 }
 
@@ -673,10 +674,18 @@ impl<'a> HttpResponseReady<'a> {
         self
     }
 
-    pub async fn failable_send(self) -> Result<(), tokio::io::Error> {
-        self.connection.write_response(self.response).await
+    pub async fn failable_send(self) -> Result<(), std::io::Error> {
+        let mut conn = self.connection.try_borrow_mut().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "connection is already in use (concurrent response on the same HttpCall)",
+            )
+        })?;
+
+        conn.write_response(self.response).await
     }
 
+    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn send(self) {
         let _ = self.failable_send().await;
     }

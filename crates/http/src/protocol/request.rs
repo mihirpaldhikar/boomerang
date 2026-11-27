@@ -19,11 +19,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-
 use crate::protocol::body::Body;
 use crate::protocol::field_lines::FieldLines;
 use crate::protocol::method::HttpMethod;
 use bytes::Bytes;
+use std::cell::{Cell, OnceCell};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -240,13 +240,14 @@ impl HttpParam {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum BodyState {
     Unread {
         content_length: usize,
         is_chunked: bool,
     },
     Reading,
-    Read(Body),
+    Read,
 }
 
 #[inline]
@@ -516,7 +517,8 @@ pub(crate) struct HttpRequest {
     pub(crate) field_lines: FieldLines,
     pub(crate) max_body_size: usize,
     pub(crate) request_timeout: std::time::Duration,
-    pub(crate) body_state: BodyState,
+    pub(crate) body_state: Cell<BodyState>,
+    pub(crate) body: OnceCell<Body>,
 
     pub(crate) path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
     pub(crate) query_params: OnceLock<Vec<(Arc<str>, Arc<str>)>>,
@@ -668,10 +670,11 @@ impl HttpRequest {
             http_version,
             field_lines,
             max_body_size,
-            body_state: BodyState::Unread {
+            body_state: Cell::new(BodyState::Unread {
                 content_length,
                 is_chunked,
-            },
+            }),
+            body: OnceCell::new(),
             path_params,
             query_params: OnceLock::new(),
             request_timeout,

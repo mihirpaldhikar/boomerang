@@ -25,16 +25,17 @@ use crate::protocol::{
 };
 use crate::server::connection::{Connection, WorkerScratch};
 use crate::server::{RequestId, RestartContext, RestartHandle};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
 pub struct HttpCall {
-    pub(crate) connection: Connection,
+    pub(crate) connection: RefCell<Connection>,
     pub(crate) request: HttpRequest,
-    pub(crate) extras: HashMap<String, String>,
+    pub(crate) extras: RefCell<HashMap<String, String>>,
     pub(crate) request_id: RequestId,
-    pub(crate) response_hook: Option<ResponseHook>,
-    pub(crate) suppress_body: bool,
+    pub(crate) response_hook: Cell<Option<ResponseHook>>,
+    pub(crate) suppress_body: Cell<bool>,
 }
 
 impl HttpCall {
@@ -63,12 +64,12 @@ impl HttpCall {
         };
 
         Ok(Some(Self {
-            connection,
+            connection: RefCell::new(connection),
             request,
-            extras: WorkerScratch::take_extras_buf(),
+            extras: RefCell::new(WorkerScratch::take_extras_buf()),
             request_id,
-            response_hook: None,
-            suppress_body: false,
+            response_hook: Cell::new(None),
+            suppress_body: Cell::new(false),
         }))
     }
 
@@ -82,13 +83,14 @@ impl HttpCall {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.connection
+            .borrow()
             .state
             .restart_handle
             .restart(force, pre_hook);
     }
 
     pub fn restart_handle(&self) -> RestartHandle {
-        (*self.connection.state.restart_handle).clone()
+        (*self.connection.borrow().state.restart_handle).clone()
     }
 
     pub fn client_ip(&self) -> IpAddr {
@@ -119,50 +121,41 @@ impl HttpCall {
         &self.request_id
     }
 
-    pub async fn body(&mut self) -> Result<&Body, String> {
-        if let BodyState::Read(ref b) = self.request.body_state {
+    #[allow(clippy::await_holding_refcell_ref)]
+    pub async fn body(&self) -> Result<&Body, String> {
+        if let Some(b) = self.request.body.get() {
             return Ok(b);
         }
 
-        let state = std::mem::replace(&mut self.request.body_state, BodyState::Reading);
-
-        let (content_length, is_chunked) = match state {
-            BodyState::Unread {
-                content_length,
-                is_chunked,
-            } => (content_length, is_chunked),
-            _ => return Err("Body already read or error occurred".into()),
+        let BodyState::Unread {
+            content_length,
+            is_chunked,
+        } = self.request.body_state.get()
+        else {
+            return Err("Body already read or error occurred".into());
         };
+
+        let mut conn = self.connection.try_borrow_mut().map_err(|_| {
+            String::from("Connection busy: cannot read body while a response is in flight")
+        })?;
+
+        self.request.body_state.set(BodyState::Reading);
 
         if self
             .header("expect")
-            .map(|v| v.eq_ignore_ascii_case("100-continue"))
-            .unwrap_or(false)
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
         {
-            let _ = self
-                .connection
-                .write_all_raw(b"HTTP/1.1 100 Continue\r\n\r\n")
-                .await;
+            let _ = conn.write_all_raw(b"HTTP/1.1 100 Continue\r\n\r\n").await;
         }
 
-        let content_type = self.header("content-type").map(|s| s.to_string());
+        let content_type = self.header("content-type").map(str::to_owned);
+        let max = self.request.max_body_size;
 
         let body_fut = async {
             if is_chunked {
-                Body::read_chunked(
-                    &mut self.connection,
-                    self.request.max_body_size,
-                    content_type,
-                )
-                .await
+                Body::read_chunked(&mut *conn, max, content_type).await
             } else {
-                Body::read_exact(
-                    &mut self.connection,
-                    content_length,
-                    self.request.max_body_size,
-                    content_type,
-                )
-                .await
+                Body::read_exact(&mut *conn, content_length, max, content_type).await
             }
         };
 
@@ -171,13 +164,8 @@ impl HttpCall {
             Err(_) => return Err("Timed out reading request body".into()),
         };
 
-        self.request.body_state = BodyState::Read(body);
-
-        if let BodyState::Read(ref b) = self.request.body_state {
-            Ok(b)
-        } else {
-            unreachable!()
-        }
+        self.request.body_state.set(BodyState::Read);
+        Ok(self.request.body.get_or_init(|| body))
     }
 
     #[inline]
@@ -210,7 +198,7 @@ impl HttpCall {
             normalized.make_ascii_lowercase();
         }
 
-        match self.extras.entry(normalized) {
+        match self.extras.borrow_mut().entry(normalized) {
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(value.into());
             }
@@ -221,52 +209,32 @@ impl HttpCall {
         }
     }
 
-    pub fn get_extras(&self, key: &str) -> Option<&str> {
-        self.extras.get(key).map(|s| s.as_str())
+    pub fn get_extras(&self, key: &str) -> Option<Ref<'_, str>> {
+        Ref::filter_map(self.extras.borrow(), |m| m.get(key).map(String::as_str)).ok()
     }
 
-    pub fn remove_extras(&mut self, key: &str) -> Option<String> {
-        self.extras.remove(key)
+    pub fn remove_extras(&self, key: &str) -> Option<String> {
+        self.extras.borrow_mut().remove(key)
     }
 
     pub(crate) fn response_sent(&self) -> bool {
-        self.connection.has_written_response()
+        self.connection.borrow().has_written_response()
     }
 
     pub(crate) fn set_response_hook(&mut self, hook: ResponseHook) {
-        self.response_hook = Some(hook);
+        self.response_hook.set(Some(hook));
     }
 
     pub(crate) fn set_suppress_body(&mut self) {
-        self.suppress_body = true;
+        self.suppress_body.set(true);
     }
 
-    pub fn response(&mut self) -> HttpResponseInit<'_> {
-        let mut field_lines = WorkerScratch::take_resp_fields();
-        field_lines.clear();
-
-        let mut response = HttpResponse::new_with_fields(
-            self.request.http_version().clone(),
-            self.request_id,
-            field_lines,
-        )
-        .with_accept_encoding(self.request.header("accept-encoding"));
-
-        if let Some(hook) = self.response_hook.take() {
-            response = response.set_on_set(hook);
-        }
-        if self.suppress_body {
-            response = response.suppress_body();
-        }
-
-        HttpResponseInit {
-            connection: &mut self.connection,
-            response,
-        }
+    pub fn response(&self) -> HttpResponseInit<'_> {
+        self.response_with_request().1
     }
 
     #[inline]
-    pub(crate) fn response_with_request(&mut self) -> (&HttpRequest, HttpResponseInit<'_>) {
+    pub(crate) fn response_with_request(&self) -> (&HttpRequest, HttpResponseInit<'_>) {
         let mut field_lines = WorkerScratch::take_resp_fields();
         field_lines.clear();
 
@@ -280,14 +248,14 @@ impl HttpCall {
         if let Some(hook) = self.response_hook.take() {
             response = response.set_on_set(hook);
         }
-        if self.suppress_body {
+        if self.suppress_body.get() {
             response = response.suppress_body();
         }
 
         (
             &self.request,
             HttpResponseInit {
-                connection: &mut self.connection,
+                connection: &self.connection,
                 response,
             },
         )
@@ -298,10 +266,10 @@ impl HttpCall {
     pub(crate) async fn discard_unread_body(&mut self) -> Result<(), std::io::Error> {
         use bytes::Buf;
 
-        let state = std::mem::replace(&mut self.request.body_state, BodyState::Reading);
+        let state = self.request.body_state.replace(BodyState::Reading);
 
         let (content_length, is_chunked) = match state {
-            BodyState::Read(_) => return Ok(()),
+            BodyState::Read => return Ok(()),
             BodyState::Reading => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -325,12 +293,16 @@ impl HttpCall {
             ));
         }
 
+        // Exclusive access, so no runtime borrow check. This borrows only the
+        // `connection` field, so it doesn't conflict with `self.request` above.
+        let conn = self.connection.get_mut();
+
         let mut remaining = content_length;
 
-        let avail = self.connection.reader.len();
+        let avail = conn.reader.len();
         if avail > 0 {
             let take = remaining.min(avail);
-            self.connection.reader.advance(take);
+            conn.reader.advance(take);
             remaining -= take;
         }
 
@@ -338,19 +310,19 @@ impl HttpCall {
             return Ok(());
         }
 
-        self.connection.flush_pipeline().await?;
+        conn.flush_pipeline().await?;
 
         let drain_fut = async {
             while remaining > 0 {
-                let n = self.connection.read_more().await?;
+                let n = conn.read_more().await?;
                 if n == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "EOF while draining unread body",
                     ));
                 }
-                let take = remaining.min(self.connection.reader.len());
-                self.connection.reader.advance(take);
+                let take = remaining.min(conn.reader.len());
+                conn.reader.advance(take);
                 remaining -= take;
             }
             Ok(())

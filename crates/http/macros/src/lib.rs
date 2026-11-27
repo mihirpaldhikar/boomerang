@@ -152,7 +152,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     if input_fn.sig.inputs.len() != 1 {
         return syn::Error::new_spanned(
             &input_fn.sig.inputs,
-            "#[route] handler must take exactly one argument: `&mut HttpCall`",
+            "#[route] handler must take exactly one argument: `&HttpCall`",
         )
         .to_compile_error()
         .into();
@@ -161,7 +161,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arg_ok = match input_fn.sig.inputs.first().unwrap() {
         syn::FnArg::Typed(pt) => match &*pt.ty {
             Type::Reference(r) => {
-                r.mutability.is_some()
+                r.mutability.is_none()
                     && matches!(
                         &*r.elem,
                         Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "HttpCall")
@@ -174,7 +174,7 @@ pub fn route(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !arg_ok {
         return syn::Error::new_spanned(
             &input_fn.sig.inputs,
-            "#[route] handler argument must be `&mut HttpCall`",
+            "#[route] handler argument must be `&HttpCall`",
         )
         .to_compile_error()
         .into();
@@ -655,7 +655,7 @@ impl Parse for JsonAst {
         }
         if input.peek(syn::LitBool) {
             let fork = input.fork();
-            if let Ok(b) = fork.parse::<syn::LitBool>() {
+            if let Ok(_b) = fork.parse::<syn::LitBool>() {
                 if fork.is_empty() || fork.peek(Token![,]) {
                     let b: syn::LitBool = input.parse()?;
                     return Ok(JsonAst::Bool(b.value));

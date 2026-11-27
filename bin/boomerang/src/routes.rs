@@ -22,7 +22,7 @@
 use http::{HttpCall, HttpStatus, route};
 
 #[route("/health", method = GET)]
-async fn health_route(call: &mut HttpCall) {
+async fn health_route(call: &HttpCall) {
     call.response()
         .text("boomerang is running")
         .status_code(HttpStatus::Ok)
