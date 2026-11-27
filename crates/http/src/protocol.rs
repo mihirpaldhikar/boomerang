@@ -28,8 +28,8 @@ mod response;
 mod status;
 mod stream;
 
-pub(crate) use body::{Body, write_json_str};
-pub use body::{IntoJsonValue, JsonValue};
+pub(crate) use body::{Body, BodyRef, write_json_str};
+pub use body::{BodyError, IntoJsonValue, JsonValue};
 pub(crate) use field_lines::FieldLines;
 pub use method::HttpMethod;
 pub(crate) use request::{BodyState, HttpParam, HttpRequest, HttpRequestError};

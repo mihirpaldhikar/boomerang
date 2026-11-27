@@ -20,11 +20,12 @@
  * SOFTWARE.
  */
 use crate::protocol::{
-    Body, BodyState, HttpMethod, HttpParam, HttpRequest, HttpRequestError, HttpResponse,
-    ResponseHook, Uninit,
+    Body, BodyError, BodyRef, BodyState, HttpMethod, HttpParam, HttpRequest, HttpRequestError,
+    HttpResponse, ResponseHook, Uninit,
 };
 use crate::server::connection::{Connection, WorkerScratch};
 use crate::server::{RequestId, RestartContext, RestartHandle};
+use bytes::Bytes;
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -122,23 +123,35 @@ impl HttpCall {
     }
 
     #[allow(clippy::await_holding_refcell_ref)]
-    pub async fn body(&self) -> Result<&Body, String> {
-        if let Some(b) = self.request.body.get() {
-            return Ok(b);
-        }
+    pub async fn body(&self) -> Result<BodyRef<'_>, BodyError> {
+        let bytes = match self.request.body.get() {
+            Some(b) => b,
+            None => {
+                let b = self.read_body().await?;
+                self.request.body.get_or_init(|| b)
+            }
+        };
+        Ok(BodyRef::new(bytes, self.request.header("content-type")))
+    }
 
+    #[allow(clippy::await_holding_refcell_ref)]
+    async fn read_body(&self) -> Result<Bytes, BodyError> {
         let BodyState::Unread {
             content_length,
             is_chunked,
         } = self.request.body_state.get()
         else {
-            return Err("Body already read or error occurred".into());
+            return Err(BodyError::Consumed);
         };
+        if content_length == 0 && !is_chunked {
+            self.request.body_state.set(BodyState::Read);
+            return Ok(Bytes::new());
+        }
 
-        let mut conn = self.connection.try_borrow_mut().map_err(|_| {
-            String::from("Connection busy: cannot read body while a response is in flight")
-        })?;
-
+        let mut conn = self
+            .connection
+            .try_borrow_mut()
+            .map_err(|_| BodyError::Busy)?;
         self.request.body_state.set(BodyState::Reading);
 
         if self
@@ -148,24 +161,20 @@ impl HttpCall {
             let _ = conn.write_all_raw(b"HTTP/1.1 100 Continue\r\n\r\n").await;
         }
 
-        let content_type = self.header("content-type").map(str::to_owned);
         let max = self.request.max_body_size;
-
-        let body_fut = async {
+        let fut = async {
             if is_chunked {
-                Body::read_chunked(&mut *conn, max, content_type).await
+                Body::read_chunked(&mut conn, max).await
             } else {
-                Body::read_exact(&mut *conn, content_length, max, content_type).await
+                Body::read_exact(&mut conn, content_length, max).await
             }
         };
-
-        let body = match tokio::time::timeout(self.request.request_timeout, body_fut).await {
-            Ok(res) => res?,
-            Err(_) => return Err("Timed out reading request body".into()),
-        };
+        let bytes = tokio::time::timeout(self.request.request_timeout, fut)
+            .await
+            .map_err(|_| BodyError::Timeout)??;
 
         self.request.body_state.set(BodyState::Read);
-        Ok(self.request.body.get_or_init(|| body))
+        Ok(bytes)
     }
 
     #[inline]

@@ -29,8 +29,99 @@ use crate::protocol::body::multipart::Multipart;
 use crate::server::Connection;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
+use crate::protocol::body::json::RawJson;
 
 static OCTET_STREAM: &[u8] = b"application/octet-stream";
+
+#[derive(Clone, Copy)]
+pub struct BodyRef<'a> {
+    bytes: &'a Bytes,
+    content_type: Option<&'a str>,
+}
+
+impl<'a> BodyRef<'a> {
+    pub(crate) fn new(bytes: &'a Bytes, content_type: Option<&'a str>) -> Self {
+        Self {
+            bytes,
+            content_type,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+    pub fn as_str(&self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.bytes)
+    }
+    pub fn content_type(&self) -> Option<&'a str> {
+        self.content_type
+    }
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn to_bytes(&self) -> Bytes {
+        self.bytes.clone()
+    }
+
+    fn is_type(&self, prefix: &str) -> bool {
+        self.content_type
+            .and_then(|ct| ct.get(..prefix.len()))
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+    }
+
+    pub fn as_json(&self) -> Option<JsonValue> {
+        self.is_type("application/json")
+            .then(|| JsonValue::parse(self.bytes).ok())
+            .flatten()
+    }
+
+    pub fn as_multipart(&self) -> Option<Multipart> {
+        if !self.is_type("multipart/form-data") {
+            return None;
+        }
+        let boundary = self.content_type?.split(';').find_map(|param| {
+            let p = param.trim();
+            p.get(..9)
+                .filter(|k| k.eq_ignore_ascii_case("boundary="))
+                .map(|_| p[9..].trim().trim_matches('"'))
+        })?;
+        Multipart::parse(self.bytes, boundary).ok()
+    }
+}
+
+impl std::ops::Deref for BodyRef<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+impl AsRef<[u8]> for BodyRef<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum BodyError {
+    #[error("body too large")]
+    TooLarge,
+    #[error("closed")]
+    Closed,
+    #[error("timeout")]
+    Timeout,
+    #[error("busy")]
+    Busy,
+    #[error("consumed")]
+    Consumed,
+    #[error("malformed: {0}")]
+    Malformed(&'static str),
+    #[error("IO err: {0}")]
+    Io(#[from] std::io::Error),
+}
 
 pub enum Body {
     Bytes {
@@ -52,8 +143,8 @@ pub enum Body {
     },
 }
 
-impl From<json::JsonValue> for Body {
-    fn from(json: json::JsonValue) -> Self {
+impl From<JsonValue> for Body {
+    fn from(json: JsonValue) -> Self {
         Self::Bytes {
             bytes: Bytes::from(json.to_vec()),
             content_type: Some("application/json".into()),
@@ -61,8 +152,8 @@ impl From<json::JsonValue> for Body {
     }
 }
 
-impl From<json::RawJson> for Body {
-    fn from(json: json::RawJson) -> Self {
+impl From<RawJson> for Body {
+    fn from(json: RawJson) -> Self {
         Self::Bytes {
             bytes: json.0,
             content_type: Some("application/json".into()),
@@ -93,121 +184,98 @@ impl Body {
         }
     }
 
+    async fn ensure(conn: &mut Connection, n: usize) -> Result<(), BodyError> {
+        while conn.reader.len() < n {
+            if conn.read_more().await? == 0 {
+                return Err(BodyError::Closed);
+            }
+        }
+        Ok(())
+    }
+
+    async fn find_line(
+        conn: &mut Connection,
+        limit: usize,
+        msg: &'static str,
+    ) -> Result<usize, BodyError> {
+        loop {
+            if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
+                return Ok(pos);
+            }
+            if conn.reader.len() > limit {
+                return Err(BodyError::Malformed(msg));
+            }
+            if conn.read_more().await? == 0 {
+                return Err(BodyError::Closed);
+            }
+        }
+    }
+
     pub(crate) async fn read_exact(
         conn: &mut Connection,
-        content_len: usize,
-        max_body_size: usize,
-        content_type: Option<String>,
-    ) -> Result<Self, String> {
+        len: usize,
+        max: usize,
+    ) -> Result<Bytes, BodyError> {
         use bytes::Buf;
-
-        if content_len > max_body_size {
-            return Err("body too large".to_string());
+        if len > max {
+            return Err(BodyError::TooLarge);
+        }
+        if conn.reader.len() >= len {
+            return Ok(conn.reader.split_to(len).freeze());
         }
 
-        if conn.reader.len() >= content_len {
-            let bytes = conn.reader.split_to(content_len).freeze();
-            return Ok(Self::Bytes {
-                bytes,
-                content_type,
-            });
-        }
+        let mut out = Vec::with_capacity(len.min(64 * 1024));
+        out.extend_from_slice(&conn.reader);
+        conn.reader.clear();
 
-        // Grow incrementally so slow/stalled clients cannot
-        // force multi-MB allocations before sending payload bytes.
-        let mut out = Vec::with_capacity(content_len.min(64 * 1024));
-        if !conn.reader.is_empty() {
-            out.extend_from_slice(&conn.reader);
-            conn.reader.clear();
-        }
-
-        while out.len() < content_len {
-            let n = conn.read_more().await.map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("stream closed unexpectedly".into());
+        while out.len() < len {
+            if conn.read_more().await? == 0 {
+                return Err(BodyError::Closed);
             }
-            let remaining = content_len - out.len();
-            let take = remaining.min(conn.reader.len());
+            let take = (len - out.len()).min(conn.reader.len());
             out.extend_from_slice(&conn.reader[..take]);
             conn.reader.advance(take);
         }
-
-        Ok(Self::Bytes {
-            bytes: out.into(),
-            content_type,
-        })
+        Ok(out.into())
     }
 
     pub(crate) async fn read_chunked(
         conn: &mut Connection,
-        max_body_size: usize,
-        content_type: Option<String>,
-    ) -> Result<Body, String> {
+        max: usize,
+    ) -> Result<Bytes, BodyError> {
         use bytes::Buf;
-
         let mut body = Vec::new();
 
         loop {
-            let pos = loop {
-                if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
-                    break pos;
-                }
-                if conn.reader.len() > 4096 {
-                    return Err("chunk size line too long".to_string());
-                }
-                let n = conn.read_more().await.map_err(|e| e.to_string())?;
-                if n == 0 {
-                    return Err("stream closed unexpectedly".into());
-                }
-            };
-
-            if pos == 0 || conn.reader[pos - 1] != b'\r' {
-                return Err("invalid chunk size line ending".to_string());
+            let pos = Self::find_line(conn, 4096, "chunk size line too long").await?;
+            if pos == 0 || conn.reader[pos - 1] != b'\r' || pos > 4096 {
+                return Err(BodyError::Malformed("invalid chunk size line"));
             }
-            if pos > 4096 {
-                return Err("chunk size line too long".to_string());
-            }
-
-            let chunk_size = {
+            let size = {
                 let line = std::str::from_utf8(&conn.reader[..pos - 1])
-                    .map_err(|_| "invalid chunk size line")?;
-                let size_str = line.split(';').next().unwrap_or("").trim();
-
-                if size_str.is_empty() || !size_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(format!("invalid chunk size: '{}'", size_str));
+                    .map_err(|_| BodyError::Malformed("invalid chunk size line"))?;
+                let s = line.split(';').next().unwrap_or("").trim();
+                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(BodyError::Malformed("invalid chunk size"));
                 }
-
-                usize::from_str_radix(size_str, 16)
-                    .map_err(|_| format!("invalid chunk size: '{}'", size_str))?
+                usize::from_str_radix(s, 16)
+                    .map_err(|_| BodyError::Malformed("invalid chunk size"))?
             };
             conn.reader.advance(pos + 1);
 
-            if chunk_size == 0 {
+            if size == 0 {
                 let mut trailer_bytes = 0usize;
                 loop {
-                    let t_pos = loop {
-                        if let Some(pos) = memchr::memchr(b'\n', &conn.reader) {
-                            break pos;
-                        }
-                        if conn.reader.len() > 16 * 1024 {
-                            return Err("chunk trailers too large".to_string());
-                        }
-                        let n = conn.read_more().await.map_err(|e| e.to_string())?;
-                        if n == 0 {
-                            return Err("stream closed before chunk trailers finished".to_string());
-                        }
-                    };
-                    if t_pos == 0 || conn.reader[t_pos - 1] != b'\r' {
-                        return Err("invalid chunk trailer line ending".to_string());
+                    let t = Self::find_line(conn, 16 * 1024, "chunk trailers too large").await?;
+                    if t == 0 || conn.reader[t - 1] != b'\r' {
+                        return Err(BodyError::Malformed("invalid chunk trailer line ending"));
                     }
-                    let line_len = t_pos + 1;
-                    trailer_bytes += line_len;
+                    trailer_bytes += t + 1;
                     if trailer_bytes > 16 * 1024 {
-                        return Err("chunk trailers too large".to_string());
+                        return Err(BodyError::Malformed("chunk trailers too large"));
                     }
-                    let is_empty_line = t_pos == 1;
-                    conn.reader.advance(line_len);
-                    if is_empty_line {
+                    conn.reader.advance(t + 1);
+                    if t == 1 {
                         break;
                     }
                 }
@@ -216,36 +284,22 @@ impl Body {
 
             let new_len = body
                 .len()
-                .checked_add(chunk_size)
-                .filter(|&l| l <= max_body_size)
-                .ok_or_else(|| "body too large".to_string())?;
+                .checked_add(size)
+                .filter(|&l| l <= max)
+                .ok_or(BodyError::TooLarge)?;
             body.reserve((new_len - body.len()).min(64 * 1024));
 
-            while conn.reader.len() < chunk_size {
-                let n = conn.read_more().await.map_err(|e| e.to_string())?;
-                if n == 0 {
-                    return Err("stream closed unexpectedly".into());
-                }
-            }
-            body.extend_from_slice(&conn.reader[..chunk_size]);
-            conn.reader.advance(chunk_size);
+            Self::ensure(conn, size).await?;
+            body.extend_from_slice(&conn.reader[..size]);
+            conn.reader.advance(size);
 
-            while conn.reader.len() < 2 {
-                let n = conn.read_more().await.map_err(|e| e.to_string())?;
-                if n == 0 {
-                    return Err("stream closed unexpectedly".into());
-                }
-            }
+            Self::ensure(conn, 2).await?;
             if &conn.reader[..2] != b"\r\n" {
-                return Err("missing CRLF after chunk data".to_string());
+                return Err(BodyError::Malformed("missing CRLF after chunk data"));
             }
             conn.reader.advance(2);
         }
-
-        Ok(Self::Bytes {
-            bytes: body.into(),
-            content_type,
-        })
+        Ok(body.into())
     }
 
     pub(crate) fn buffered_len(&self) -> Option<usize> {
@@ -254,75 +308,5 @@ impl Body {
             Body::PooledVec { bytes, .. } => Some(bytes.len()),
             _ => None,
         }
-    }
-
-    pub fn as_json(&self) -> Option<JsonValue> {
-        let (slice, content_type): (&[u8], &Option<String>) = match self {
-            Self::Bytes {
-                bytes,
-                content_type,
-            } => (bytes, content_type),
-            Self::PooledVec {
-                bytes,
-                content_type,
-            } => (bytes, content_type),
-            Self::Stream { .. } | Self::ChunkStream { .. } => return None,
-        };
-        match content_type {
-            Some(ct)
-                if ct
-                    .get(..16)
-                    .map_or(false, |p| p.eq_ignore_ascii_case("application/json")) =>
-            {
-                json::JsonValue::parse(slice).ok()
-            }
-            _ => None,
-        }
-    }
-
-    pub fn as_multipart(&self) -> Option<Multipart> {
-        let (slice_bytes, content_type): (Bytes, &Option<String>) = match self {
-            Self::Bytes {
-                bytes,
-                content_type,
-            } => (bytes.clone(), content_type),
-            Self::PooledVec { .. } | Self::Stream { .. } | Self::ChunkStream { .. } => {
-                return None;
-            }
-        };
-
-        match content_type {
-            Some(ct)
-                if ct
-                    .get(..19)
-                    .map_or(false, |p| p.eq_ignore_ascii_case("multipart/form-data")) =>
-            {
-                let boundary = ct.split(';').find_map(|param| {
-                    let p = param.trim();
-                    if p.len() >= 9 && p[..9].eq_ignore_ascii_case("boundary=") {
-                        Some(p[9..].trim().trim_matches('"'))
-                    } else {
-                        None
-                    }
-                })?;
-
-                Multipart::parse(&slice_bytes, boundary).ok()
-            }
-            _ => None,
-        }
-    }
-
-    pub fn to_bytes(&self) -> Bytes {
-        match self {
-            Body::Bytes { bytes, .. } => bytes.clone(),
-            Body::PooledVec { bytes, .. } => Bytes::copy_from_slice(bytes),
-            Body::Stream { .. } | Body::ChunkStream { .. } => {
-                panic!("cannot convert stream body to bytes")
-            }
-        }
-    }
-
-    pub fn is_stream(&self) -> bool {
-        matches!(self, Body::Stream { .. } | Body::ChunkStream { .. })
     }
 }

@@ -19,7 +19,6 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use crate::protocol::body::Body;
 use crate::protocol::field_lines::FieldLines;
 use crate::protocol::method::HttpMethod;
 use bytes::Bytes;
@@ -518,7 +517,7 @@ pub(crate) struct HttpRequest {
     pub(crate) max_body_size: usize,
     pub(crate) request_timeout: std::time::Duration,
     pub(crate) body_state: Cell<BodyState>,
-    pub(crate) body: OnceCell<Body>,
+    pub(crate) body: OnceCell<Bytes>,
 
     pub(crate) path_params: Vec<(Arc<str>, std::ops::Range<usize>)>,
     pub(crate) query_params: OnceLock<Vec<(Arc<str>, Arc<str>)>>,
