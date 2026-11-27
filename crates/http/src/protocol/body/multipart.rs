@@ -19,8 +19,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-use crate::protocol::body::OCTET_STREAM;
-use bytes::Bytes;
+use memchr::memmem;
+
+const OCTET_STREAM: &str = "application/octet-stream";
 
 #[derive(thiserror::Error, Debug)]
 pub enum MultipartError {
@@ -32,104 +33,95 @@ pub enum MultipartError {
     Utf8(#[from] std::str::Utf8Error),
 }
 
-#[derive(Debug)]
-pub struct MultiPartField {
-    name: Bytes,
-    content_type: Option<Bytes>,
-    content: Bytes,
+#[derive(Debug, Clone, Copy)]
+pub struct MultiPartField<'a> {
+    name: &'a str,
+    filename: Option<&'a str>,
+    content_type: Option<&'a str>,
+    content: &'a [u8],
 }
 
-impl MultiPartField {
+impl<'a> MultiPartField<'a> {
     #[inline]
-    pub fn name(&self) -> &str {
-        // SAFETY: validated as UTF-8 in `Multipart::parse_header_line`.
-        unsafe { std::str::from_utf8_unchecked(&self.name) }
+    pub fn name(&self) -> &'a str {
+        self.name
     }
 
     #[inline]
-    pub fn content_type(&self) -> Option<&str> {
-        // SAFETY: validated as UTF-8 (or static ASCII) in `Multipart::parse_headers_memchr`.
+    pub fn filename(&self) -> Option<&'a str> {
+        self.filename
+    }
+    #[inline]
+    pub fn content_type(&self) -> Option<&'a str> {
         self.content_type
-            .as_ref()
-            .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
     }
-
     #[inline]
-    pub fn content(&self) -> &Bytes {
-        &self.content
+    pub fn content(&self) -> &'a [u8] {
+        self.content
+    }
+    #[inline]
+    pub fn text(&self) -> Result<&'a str, std::str::Utf8Error> {
+        std::str::from_utf8(self.content)
     }
 }
 
-pub struct Multipart {
-    fields: Vec<MultiPartField>,
+pub struct Multipart<'a> {
+    fields: Vec<MultiPartField<'a>>,
 }
 
-impl Multipart {
-    pub(crate) fn parse(body: &Bytes, boundary: &str) -> Result<Self, MultipartError> {
-        if boundary.is_empty() {
+impl<'a> Multipart<'a> {
+    pub(crate) fn parse(body: &'a [u8], boundary: &str) -> Result<Self, MultipartError> {
+        let b = boundary.as_bytes();
+        if b.is_empty() {
             return Err(MultipartError::MissingBoundary);
         }
+        if b.len() > 70 {
+            return Err(MultipartError::Malformed("boundary too long"));
+        }
 
-        let buf = body.as_ref();
-        let b_bytes = boundary.as_bytes();
-        let marker_len = 2 + 2 + b_bytes.len() + 2;
-
-        let mut stack_marker = [0u8; 76];
-        let mut heap_marker = Vec::new();
-        let marker: &mut [u8] = if marker_len <= stack_marker.len() {
-            &mut stack_marker[..marker_len]
-        } else {
-            heap_marker.resize(marker_len, 0);
-            &mut heap_marker
-        };
-
-        marker[0..4].copy_from_slice(b"\r\n--");
-        marker[4..4 + b_bytes.len()].copy_from_slice(b_bytes);
-        marker[4 + b_bytes.len()..].copy_from_slice(b"\r\n");
-
+        let mut scratch = [0u8; 76];
+        let n = 6 + b.len();
+        scratch[..4].copy_from_slice(b"\r\n--");
+        scratch[4..4 + b.len()].copy_from_slice(b);
+        scratch[4 + b.len()..n].copy_from_slice(b"\r\n");
+        let marker = &scratch[..n];
         let open = &marker[2..];
-        let mid = &marker[..marker_len - 2];
+        let mid = &marker[..n - 2];
 
-        let first = memchr::memmem::find(buf, open).ok_or(MultipartError::MissingBoundary)?;
+        let first = memmem::find(body, open).ok_or(MultipartError::MissingBoundary)?;
         let mut pos = first + open.len();
 
-        let mid_finder = memchr::memmem::Finder::new(mid);
-        let hdr_end_finder = memchr::memmem::Finder::new(b"\r\n\r\n");
-        let base_ptr = buf.as_ptr() as usize;
-
+        let mid_finder = memmem::Finder::new(mid);
+        let hdr_finder = memmem::Finder::new(b"\r\n\r\n");
         let mut fields = Vec::with_capacity(4);
 
         loop {
-            let hdr_rel = hdr_end_finder
-                .find(&buf[pos..])
-                .ok_or(MultipartError::Malformed("headers missing CRLFCRLF"))?;
-            let hdr_end = pos + hdr_rel;
-            let headers = &buf[pos..hdr_end];
-            let (name, content_type) = Self::parse_headers_memchr(body, base_ptr, headers)?;
+            let hdr_end = pos
+                + hdr_finder
+                    .find(&body[pos..])
+                    .ok_or(MultipartError::Malformed("headers missing CRLFCRLF"))?;
+
+            let hdr = std::str::from_utf8(&body[pos..hdr_end])?;
+            let (name, filename, content_type) = parse_headers(hdr)?;
 
             let data_start = hdr_end + 4;
-            let rel = mid_finder
-                .find(&buf[data_start..])
-                .ok_or(MultipartError::Malformed("next boundary not found"))?;
-            let delim_at = data_start + rel;
+            let delim = data_start
+                + mid_finder
+                    .find(&body[data_start..])
+                    .ok_or(MultipartError::Malformed("next boundary not found"))?;
 
-            let data = body.slice(data_start..delim_at);
             fields.push(MultiPartField {
                 name,
+                filename,
                 content_type,
-                content: data,
+                content: &body[data_start..delim],
             });
 
-            let after = delim_at + mid.len();
-            if buf.get(after..after + 2) == Some(b"--") {
-                break;
-            }
-            if buf.get(after..after + 2) != Some(b"\r\n") {
-                return Err(MultipartError::Malformed("boundary line missing CRLF"));
-            }
-            pos = after + 2;
-            if pos >= buf.len() {
-                break;
+            let after = delim + mid.len();
+            match body.get(after..after + 2) {
+                Some(b"--") => break,
+                Some(b"\r\n") => pos = after + 2,
+                _ => return Err(MultipartError::Malformed("boundary line missing CRLF")),
             }
         }
 
@@ -137,122 +129,95 @@ impl Multipart {
     }
 
     #[inline]
-    pub fn get(&self, name: &str) -> Option<&MultiPartField> {
-        self.fields.iter().rfind(|f| f.name() == name)
+    pub fn get(&self, name: &str) -> Option<MultiPartField<'a>> {
+        self.fields.iter().rfind(|f| f.name == name).copied()
     }
 
     #[inline]
-    pub fn fields(&self) -> &[MultiPartField] {
+    pub fn fields(&self) -> &[MultiPartField<'a>] {
         &self.fields
     }
+}
 
-    #[inline]
-    fn slice_str_as_bytes(body: &Bytes, base_ptr: usize, s: &str) -> Bytes {
-        let start = s.as_ptr() as usize - base_ptr;
-        body.slice(start..start + s.len())
-    }
+type PartHeaders<'a> = (&'a str, Option<&'a str>, Option<&'a str>);
 
-    #[inline]
-    fn parse_headers_memchr(
-        body: &Bytes,
-        base_ptr: usize,
-        hdr: &[u8],
-    ) -> Result<(Bytes, Option<Bytes>), MultipartError> {
-        let mut name: Option<Bytes> = None;
-        let mut has_filename = false;
-        let mut ctype: Option<Bytes> = None;
+fn parse_headers(hdr: &str) -> Result<PartHeaders<'_>, MultipartError> {
+    let (mut name, mut filename, mut ctype) = (None, None, None);
 
-        let mut start = 0;
-        while start <= hdr.len() {
-            let next = match memchr::memchr(b'\n', &hdr[start..]) {
-                Some(off) => start + off,
-                None => {
-                    if start < hdr.len() {
-                        Self::parse_header_line(
-                            body,
-                            base_ptr,
-                            &hdr[start..],
-                            &mut name,
-                            &mut has_filename,
-                            &mut ctype,
-                        )?;
-                    }
-                    break;
-                }
-            };
-
-            let line = if next > start && hdr[next - 1] == b'\r' {
-                &hdr[start..next - 1]
-            } else {
-                &hdr[start..next]
-            };
-
-            if !line.is_empty() {
-                Self::parse_header_line(
-                    body,
-                    base_ptr,
-                    line,
-                    &mut name,
-                    &mut has_filename,
-                    &mut ctype,
-                )?;
-            }
-
-            start = next + 1;
-        }
-
-        let name = name.ok_or(MultipartError::Malformed(
-            "missing Content-Disposition name",
-        ))?;
-
-        if ctype.is_none() && has_filename {
-            ctype = Some(Bytes::from_static(OCTET_STREAM));
-        }
-        Ok((name, ctype))
-    }
-
-    #[inline]
-    fn parse_header_line(
-        body: &Bytes,
-        base_ptr: usize,
-        line: &[u8],
-        name: &mut Option<Bytes>,
-        has_filename: &mut bool,
-        ctype: &mut Option<Bytes>,
-    ) -> Result<(), MultipartError> {
-        let s = std::str::from_utf8(line)?;
-
-        let Some(colon) = memchr::memchr(b':', line) else {
-            return Ok(());
+    for line in hdr.split('\n') {
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
         };
-        let key = s[..colon].trim();
-        let val = s[colon + 1..].trim();
+        let (key, val) = (key.trim(), val.trim());
 
-        if key.eq_ignore_ascii_case("Content-Type") {
+        if key.eq_ignore_ascii_case("content-type") {
             if !val.is_empty() {
-                *ctype = Some(Self::slice_str_as_bytes(body, base_ptr, val));
+                ctype = Some(val);
             }
-        } else if key.eq_ignore_ascii_case("Content-Disposition") {
-            for seg in val.split(';') {
-                let seg = seg.trim();
-                if seg.len() >= 5 && seg[..5].eq_ignore_ascii_case("name=") {
-                    let unquoted = Self::unquote(&seg[5..]);
-                    *name = Some(Self::slice_str_as_bytes(body, base_ptr, unquoted));
-                } else if seg.len() >= 9 && seg[..9].eq_ignore_ascii_case("filename=") {
-                    *has_filename = true;
+        } else if key.eq_ignore_ascii_case("content-disposition") {
+            for (k, v) in params(val) {
+                if k.eq_ignore_ascii_case("name") {
+                    name = Some(v);
+                } else if k.eq_ignore_ascii_case("filename") {
+                    filename = Some(v);
                 }
             }
         }
-        Ok(())
     }
 
-    #[inline]
-    fn unquote(s: &str) -> &str {
-        let s = s.trim();
-        if s.len() >= 2 && s.as_bytes()[0] == b'"' && s.as_bytes()[s.len() - 1] == b'"' {
-            &s[1..s.len() - 1]
-        } else {
-            s
-        }
+    let name = name.ok_or(MultipartError::Malformed(
+        "missing Content-Disposition name",
+    ))?;
+    if ctype.is_none() && filename.is_some() {
+        ctype = Some(OCTET_STREAM);
     }
+    Ok((name, filename, ctype))
+}
+
+fn params(s: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut rest = s.split_once(';').map_or("", |(_, r)| r);
+
+    std::iter::from_fn(move || {
+        loop {
+            rest = rest.trim_start_matches(|c: char| c == ';' || c.is_ascii_whitespace());
+            if rest.is_empty() {
+                return None;
+            }
+            let eq = rest.find('=');
+            let semi = rest.find(';');
+
+            match (eq, semi) {
+                (Some(e), sc) if sc.map_or(true, |sc| e < sc) => {
+                    let key = rest[..e].trim_end();
+                    let after = rest[e + 1..].trim_start();
+                    let (val, tail) = if let Some(q) = after.strip_prefix('"') {
+                        match closing_quote(q) {
+                            Some(end) => (&q[..end], &q[end + 1..]),
+                            None => (q, ""),
+                        }
+                    } else {
+                        let end = after.find(';').unwrap_or(after.len());
+                        (after[..end].trim_end(), &after[end..])
+                    };
+                    rest = tail;
+                    return Some((key, val));
+                }
+                (_, Some(sc)) => rest = &rest[sc + 1..],
+                _ => return None,
+            }
+        }
+    })
+}
+
+fn closing_quote(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while let Some(off) = b.get(i..).and_then(|t| memchr::memchr2(b'"', b'\\', t)) {
+        let p = i + off;
+        if b[p] == b'"' {
+            return Some(p);
+        }
+        i = p + 2;
+    }
+    None
 }

@@ -32,8 +32,6 @@ use crate::server::Connection;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
 
-static OCTET_STREAM: &[u8] = b"application/octet-stream";
-
 #[derive(Clone, Copy)]
 pub struct BodyRef<'a> {
     bytes: &'a Bytes,
@@ -98,7 +96,7 @@ impl<'a> BodyRef<'a> {
         JsonRef::parse(self.bytes).map_err(|_| BodyError::Malformed("invalid JSON"))
     }
 
-    pub fn as_multipart(&self) -> Option<Multipart> {
+    pub fn as_multipart(&self) -> Option<Multipart<'a>> {
         if !self.is_type("multipart/form-data") {
             return None;
         }
