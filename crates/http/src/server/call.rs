@@ -21,7 +21,7 @@
  */
 use crate::protocol::{
     Body, BodyState, HttpMethod, HttpParam, HttpRequest, HttpRequestError, HttpResponse,
-    HttpResponseInit, ResponseHook,
+    ResponseHook, Uninit,
 };
 use crate::server::connection::{Connection, WorkerScratch};
 use crate::server::{RequestId, RestartContext, RestartHandle};
@@ -229,12 +229,12 @@ impl HttpCall {
         self.suppress_body.set(true);
     }
 
-    pub fn response(&self) -> HttpResponseInit<'_> {
+    pub fn response(&self) -> HttpResponse<'_, Uninit> {
         self.response_with_request().1
     }
 
     #[inline]
-    pub(crate) fn response_with_request(&self) -> (&HttpRequest, HttpResponseInit<'_>) {
+    pub(crate) fn response_with_request(&self) -> (&HttpRequest, HttpResponse<'_, Uninit>) {
         let mut field_lines = WorkerScratch::take_resp_fields();
         field_lines.clear();
 
@@ -252,13 +252,7 @@ impl HttpCall {
             response = response.suppress_body();
         }
 
-        (
-            &self.request,
-            HttpResponseInit {
-                connection: &self.connection,
-                response,
-            },
-        )
+        (&self.request, response.attach(&self.connection))
     }
 }
 

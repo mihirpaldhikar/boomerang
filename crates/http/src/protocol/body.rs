@@ -248,6 +248,14 @@ impl Body {
         })
     }
 
+    pub(crate) fn buffered_len(&self) -> Option<usize> {
+        match self {
+            Body::Bytes { bytes, .. } => Some(bytes.len()),
+            Body::PooledVec { bytes, .. } => Some(bytes.len()),
+            _ => None,
+        }
+    }
+
     pub fn as_json(&self) -> Option<JsonValue> {
         let (slice, content_type): (&[u8], &Option<String>) = match self {
             Self::Bytes {

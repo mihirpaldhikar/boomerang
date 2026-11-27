@@ -20,7 +20,7 @@
  * SOFTWARE.
  */
 
-use crate::protocol::{HttpMethod, HttpResponse, HttpResponseBodyUnInitialized, HttpStatus};
+use crate::protocol::{HttpMethod, HttpResponse, HttpStatus};
 use crate::server::HttpCall;
 use std::marker::PhantomData;
 
@@ -70,11 +70,11 @@ impl Cors {
         self.apply_cors(call, true).await;
     }
 
-    pub fn add_cors_headers(
+    pub fn add_cors_headers<'a, S>(
         &self,
         call: &HttpCall,
-        resp: HttpResponse<HttpResponseBodyUnInitialized>,
-    ) -> HttpResponse<HttpResponseBodyUnInitialized> {
+        resp: HttpResponse<'a, S>,
+    ) -> HttpResponse<'a, S> {
         let origin = if matches!(self.allowed_origin, AllowedOrigin::Any) && !self.allow_credentials
         {
             None
@@ -88,22 +88,17 @@ impl Cors {
 
         let mut response = resp.__add_header_internal("access-control-allow-origin", allow_origin);
 
-        let vary_origin =
-            self.allow_credentials || !matches!(self.allowed_origin, AllowedOrigin::Any);
         if self.allow_credentials {
             response = response.__add_header_internal("access-control-allow-credentials", "true");
         }
-
         if !self.allowed_methods_str.is_empty() {
             response = response
                 .__add_header_internal("access-control-allow-methods", &self.allowed_methods_str);
         }
-
         if let Some(exposed) = &self.exposed_headers_str {
             response = response.__add_header_internal("access-control-expose-headers", exposed);
         }
-
-        if vary_origin {
+        if self.allow_credentials || !matches!(self.allowed_origin, AllowedOrigin::Any) {
             response = response.__add_header_internal("vary", "Origin");
         }
 

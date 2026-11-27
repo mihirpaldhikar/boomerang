@@ -29,35 +29,30 @@ use crate::server::{Connection, WorkerScratch};
 use bytes::Bytes;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, BufReader};
 
-const ENC_ZSTD: u8 = 1 << 0;
-const ENC_BR: u8 = 1 << 1;
-const ENC_GZIP: u8 = 1 << 2;
+const ENCODINGS: [&str; 3] = ["zstd", "br", "gzip"]; // priority order
 
 #[inline]
-fn parse_accept_encoding_mask(header: &str) -> u8 {
-    let mut mask = 0u8;
-    for part in header.split(',') {
-        let token = part.split(';').next().unwrap_or("").trim();
-        if token.eq_ignore_ascii_case("zstd") {
-            mask |= ENC_ZSTD;
-        } else if token.eq_ignore_ascii_case("br") {
-            mask |= ENC_BR;
-        } else if token.eq_ignore_ascii_case("gzip") {
-            mask |= ENC_GZIP;
-        }
-    }
-    mask
+fn pick_encoding(header: &str) -> Option<&'static str> {
+    header
+        .split(',')
+        .filter_map(|part| {
+            let token = part.split(';').next()?.trim();
+            ENCODINGS.iter().position(|e| token.eq_ignore_ascii_case(e))
+        })
+        .min()
+        .map(|i| ENCODINGS[i])
 }
+
+pub struct Uninit;
+pub struct Ready;
 
 pub(crate) type ResponseHook = Arc<dyn Fn(HttpStatus) + Send + Sync>;
 
-pub struct HttpResponseBodyUnInitialized;
-pub struct HttpResponseBodyInitialized;
-
-pub struct HttpResponse<State> {
+pub(crate) struct ResponseParts {
     pub(crate) http_version: Bytes,
     pub(crate) request_id: RequestId,
     pub(crate) status_code: HttpStatus,
@@ -69,349 +64,98 @@ pub struct HttpResponse<State> {
     pub(crate) cookies: Option<CookieStore>,
     pub(crate) suppress_body: bool,
     pub(crate) on_sent: Option<ResponseHook>,
-    pub(crate) accept_encoding_mask: u8,
-    pub(crate) _state: std::marker::PhantomData<State>,
+    pub(crate) accept_encoding: Option<&'static str>,
 }
 
-impl HttpResponse<HttpResponseBodyUnInitialized> {
-    pub(crate) fn new<B: Into<Bytes>>(http_version: B, request_id: RequestId) -> Self {
-        Self::new_with_fields(http_version, request_id, FieldLines::with_capacity(6, 128))
-    }
-
-    pub(crate) fn new_with_fields<B: Into<Bytes>>(
-        http_version: B,
-        request_id: RequestId,
-        field_lines: FieldLines,
-    ) -> Self {
-        Self {
-            http_version: http_version.into(),
-            request_id,
-            status_code: HttpStatus::Ok,
-            content_type: None,
-            content_length: None,
-            is_chunked: false,
-            body: None,
-            field_lines,
-            cookies: None,
-            suppress_body: false,
-            on_sent: None,
-            accept_encoding_mask: 0,
-            _state: std::marker::PhantomData,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn into_pooled_body(
-        mut self,
-        buf: Vec<u8>,
-        content_type: &'static str,
-    ) -> HttpResponse<HttpResponseBodyInitialized> {
-        self.content_type = Some(Cow::Borrowed(content_type));
-        self.content_length = Some(buf.len() as u64);
-        self.is_chunked = false;
-        self.into_initialized(Some(Body::PooledVec {
-            bytes: buf,
-            content_type: None,
-        }))
-    }
-
-    #[inline]
-    pub(crate) fn with_accept_encoding(mut self, header: Option<&str>) -> Self {
-        if let Some(h) = header {
-            self.accept_encoding_mask = parse_accept_encoding_mask(h);
-        }
-        self
-    }
-
-    #[inline]
-    fn into_initialized(self, body: Option<Body>) -> HttpResponse<HttpResponseBodyInitialized> {
-        HttpResponse {
-            http_version: self.http_version,
-            request_id: self.request_id,
-            status_code: self.status_code,
-            content_type: self.content_type,
-            content_length: self.content_length,
-            is_chunked: self.is_chunked,
-            body,
-            field_lines: self.field_lines,
-            cookies: self.cookies,
-            suppress_body: self.suppress_body,
-            on_sent: self.on_sent,
-            accept_encoding_mask: self.accept_encoding_mask,
-            _state: std::marker::PhantomData,
-        }
-    }
-
-    pub fn json<V: crate::protocol::body::ToJson>(
-        self,
-        value: V,
-    ) -> HttpResponse<HttpResponseBodyInitialized> {
-        let mut buf = Vec::with_capacity(value.size_hint());
-        value.write_json(&mut buf);
-        self.into_pooled_body(buf, "application/json")
-    }
-
-    pub fn text<V: AsRef<str>>(self, val: V) -> HttpResponse<HttpResponseBodyInitialized> {
-        self.into_pooled_body(val.as_ref().as_bytes().to_vec(), "text/plain")
-    }
-
-    pub fn bytes<V: Into<Bytes>, C: Into<Cow<'static, str>>>(
-        mut self,
-        bytes: V,
-        content_type: C,
-    ) -> HttpResponse<HttpResponseBodyInitialized> {
-        let bytes = bytes.into();
-        self.content_type = Some(content_type.into());
-        self.content_length = Some(bytes.len() as u64);
-        self.is_chunked = false;
-        self.into_initialized(Some(Body::Bytes {
-            bytes,
-            content_type: None,
-        }))
-    }
-
-    pub fn stream_from<S, C>(
-        mut self,
-        source: S,
-        content_type: C,
-    ) -> HttpResponse<HttpResponseBodyInitialized>
-    where
-        S: crate::protocol::stream::IntoBodyStream + 'static,
-        C: Into<Cow<'static, str>>,
-    {
-        self.content_type = Some(content_type.into());
-        self.is_chunked = true;
-        self.content_length = None;
-        self.into_initialized(Some(Body::ChunkStream {
-            source: Box::new(source.into_body_stream()),
-            content_length: None,
-        }))
-    }
-
-    pub fn stream_from_len<S, C>(
-        mut self,
-        source: S,
-        content_len: u64,
-        content_type: C,
-    ) -> HttpResponse<HttpResponseBodyInitialized>
-    where
-        S: crate::protocol::stream::IntoBodyStream + 'static,
-        C: Into<Cow<'static, str>>,
-    {
-        self.content_type = Some(content_type.into());
-        self.is_chunked = false;
-        self.content_length = Some(content_len);
-        self.into_initialized(Some(Body::ChunkStream {
-            source: Box::new(source.into_body_stream()),
-            content_length: Some(content_len),
-        }))
-    }
-
-    pub fn stream_with<F, Fut, E, C>(
-        mut self,
-        content_type: C,
-        producer: F,
-    ) -> HttpResponse<HttpResponseBodyInitialized>
-    where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
-        Fut: Future<Output = Result<(), E>> + 'static,
-        E: crate::protocol::stream::StreamError,
-        C: Into<Cow<'static, str>>,
-    {
-        let (tx, rx) = crate::protocol::stream::stream_channel(16);
-        let handle = tokio::task::spawn_local(async move {
-            let err_tx = tx.clone();
-            if let Err(err) = producer(tx).await {
-                err_tx.apply_error(err).await;
-            }
-        });
-
-        self.content_type = Some(content_type.into());
-        self.is_chunked = true;
-        self.content_length = None;
-        self.into_initialized(Some(Body::ChunkStream {
-            source: Box::new(crate::protocol::stream::ManagedStreamSource {
-                inner: rx,
-                handle: Some(handle),
-            }),
-            content_length: None,
-        }))
-    }
-
-    pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponse<HttpResponseBodyInitialized>
-    where
-        F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
-        Fut: Future<Output = Result<(), E>> + 'static,
-        E: crate::protocol::stream::StreamError,
-    {
-        self.__add_header_internal("cache-control", "no-cache")
-            .stream_with(Cow::Borrowed("text/event-stream"), producer)
-    }
-
-    pub fn declare_trailers<S: AsRef<str>>(self, header_names: S) -> Self {
-        self.__add_header_internal("trailer", header_names.as_ref())
-    }
-
-    pub fn empty(self) -> HttpResponse<HttpResponseBodyInitialized> {
-        self.into_initialized(None)
-    }
-}
-
-impl HttpResponse<HttpResponseBodyInitialized> {
-    pub async fn compress(mut self) -> Self {
-        let fallback_ae = self.field_lines.remove("accept-encoding");
-        let mask = if self.accept_encoding_mask != 0 {
-            self.accept_encoding_mask
-        } else if let Some(ref ae) = fallback_ae {
-            parse_accept_encoding_mask(ae)
-        } else {
-            0
+impl ResponseParts {
+    async fn compress(&mut self) {
+        let fallback = self.field_lines.remove("accept-encoding");
+        let Some(encoding) = self
+            .accept_encoding
+            .or_else(|| fallback.as_deref().and_then(pick_encoding))
+        else {
+            return;
         };
 
-        if mask == 0 || self.field_lines.get("content-encoding").is_some() {
-            return self;
-        }
-
-        let Some(body) = self.body.take() else {
-            return self;
-        };
-
-        let is_compressible = self
+        let compressible = self
             .content_type
             .as_deref()
             .filter(|ct| !ct.eq_ignore_ascii_case("text/event-stream"))
-            .map(Compress::is_compressible)
-            .unwrap_or(false);
-
-        if !is_compressible {
-            self.body = Some(body);
-            return self;
+            .is_some_and(Compress::is_compressible);
+        if !compressible || self.field_lines.get("content-encoding").is_some() {
+            return;
         }
 
-        let encoding = if (mask & ENC_ZSTD) != 0 {
-            "zstd"
-        } else if (mask & ENC_BR) != 0 {
-            "br"
-        } else if (mask & ENC_GZIP) != 0 {
-            "gzip"
-        } else {
-            self.body = Some(body);
-            return self;
-        };
+        let Some(body) = self.body.take() else { return };
 
-        match body {
+        if body.buffered_len().is_some_and(|n| n < 1024) {
+            self.body = Some(body);
+            return;
+        }
+
+        self.body = Some(match body {
             Body::Bytes {
                 bytes,
                 content_type,
-            } => {
-                if bytes.len() < 1024 {
-                    self.body = Some(Body::Bytes {
-                        bytes,
-                        content_type,
-                    });
-                    return self;
-                }
-
-                let orig_len = bytes.len();
-                let compressed = Compress::compress_bytes(bytes.clone(), encoding).await;
-
-                if compressed.len() >= orig_len {
-                    self.body = Some(Body::Bytes {
-                        bytes,
-                        content_type,
-                    });
-                    return self;
-                }
-
-                self.content_length = Some(compressed.len() as u64);
-                self.field_lines.set("content-encoding", encoding);
-                self.field_lines.set("vary", "Accept-Encoding");
-
-                self.body = Some(Body::PooledVec {
-                    bytes: compressed,
-                    content_type,
-                });
-            }
+            } => self.compress_buffered(bytes, content_type, encoding).await,
             Body::PooledVec {
                 bytes,
                 content_type,
             } => {
-                if bytes.len() < 1024 {
-                    self.body = Some(Body::PooledVec {
-                        bytes,
-                        content_type,
-                    });
-                    return self;
-                }
-
-                let orig_len = bytes.len();
-                let owned_bytes = Bytes::from(bytes);
-                let compressed = Compress::compress_bytes(owned_bytes.clone(), encoding).await;
-
-                if compressed.len() >= orig_len {
-                    self.body = Some(Body::Bytes {
-                        bytes: owned_bytes,
-                        content_type,
-                    });
-                    return self;
-                }
-
-                self.content_length = Some(compressed.len() as u64);
-                self.field_lines.set("content-encoding", encoding);
-                self.field_lines.set("vary", "Accept-Encoding");
-
-                self.body = Some(Body::PooledVec {
-                    bytes: compressed,
-                    content_type,
-                });
+                self.compress_buffered(Bytes::from(bytes), content_type, encoding)
+                    .await
             }
             Body::Stream {
                 reader,
                 content_type,
                 ..
-            } => {
-                self.body = Some(Self::wrap_compressed_stream(
-                    reader,
-                    content_type,
-                    encoding,
-                    &mut self.content_length,
-                    &mut self.is_chunked,
-                    &mut self.field_lines,
-                ));
-            }
+            } => self.compressed_stream(reader, content_type, encoding),
             Body::ChunkStream { source, .. } => {
-                let reader: Box<dyn AsyncRead + Unpin + Send> =
-                    Box::new(crate::protocol::stream::ChunkSourceReader::new(source));
-                self.body = Some(Self::wrap_compressed_stream(
-                    reader,
-                    None,
-                    encoding,
-                    &mut self.content_length,
-                    &mut self.is_chunked,
-                    &mut self.field_lines,
-                ));
+                let reader = Box::new(crate::protocol::stream::ChunkSourceReader::new(source));
+                self.compressed_stream(reader, None, encoding)
             }
-        }
-
-        self
+        });
     }
 
-    fn wrap_compressed_stream(
+    fn set_encoding_headers(&mut self, encoding: &'static str) {
+        self.field_lines.set("content-encoding", encoding);
+        self.field_lines.set("vary", "Accept-Encoding");
+    }
+
+    async fn compress_buffered(
+        &mut self,
+        bytes: Bytes,
+        content_type: Option<String>,
+        encoding: &'static str,
+    ) -> Body {
+        let compressed = Compress::compress_bytes(bytes.clone(), encoding).await;
+        if compressed.len() >= bytes.len() {
+            return Body::Bytes {
+                bytes,
+                content_type,
+            };
+        }
+        self.content_length = Some(compressed.len() as u64);
+        self.set_encoding_headers(encoding);
+        Body::PooledVec {
+            bytes: compressed,
+            content_type,
+        }
+    }
+
+    fn compressed_stream(
+        &mut self,
         reader: Box<dyn AsyncRead + Unpin + Send>,
         content_type: Option<String>,
         encoding: &'static str,
-        content_length: &mut Option<u64>,
-        is_chunked: &mut bool,
-        field_lines: &mut FieldLines,
     ) -> Body {
-        field_lines.remove("content-length");
-        *content_length = None;
-        *is_chunked = true;
-        field_lines.set("content-encoding", encoding);
-        field_lines.set("vary", "Accept-Encoding");
+        self.field_lines.remove("content-length");
+        self.content_length = None;
+        self.is_chunked = true;
+        self.set_encoding_headers(encoding);
 
         let buffered = BufReader::with_capacity(64 * 1024, reader);
-        let compressed_reader: Box<dyn AsyncRead + Unpin + Send> = match encoding {
+        let reader: Box<dyn AsyncRead + Unpin + Send> = match encoding {
             "zstd" => Box::new(
                 async_compression::tokio::bufread::ZstdEncoder::with_quality(
                     buffered,
@@ -431,99 +175,63 @@ impl HttpResponse<HttpResponseBodyInitialized> {
                 ),
             ),
         };
-
         Body::Stream {
-            reader: compressed_reader,
+            reader,
             content_length: 0,
             content_type,
         }
     }
 }
 
-impl<State> HttpResponse<State> {
-    pub fn status_code(mut self, status_code: HttpStatus) -> Self {
-        self.status_code = status_code;
+pub struct HttpResponse<'a, S> {
+    parts: ResponseParts,
+    conn: Option<&'a RefCell<Connection>>,
+    _state: PhantomData<S>,
+}
+
+impl<'a, S> HttpResponse<'a, S> {
+    fn into_state<T>(self) -> HttpResponse<'a, T> {
+        HttpResponse {
+            parts: self.parts,
+            conn: self.conn,
+            _state: PhantomData,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> ResponseParts {
+        self.parts
+    }
+
+    pub(crate) fn attach(mut self, conn: &'a RefCell<Connection>) -> Self {
+        self.conn = Some(conn);
+        self
+    }
+
+    pub(crate) fn with_accept_encoding(mut self, header: Option<&str>) -> Self {
+        self.parts.accept_encoding = header.and_then(pick_encoding);
         self
     }
 
     pub(crate) fn set_on_set(mut self, hook: ResponseHook) -> Self {
-        self.on_sent = Some(hook);
-        self
-    }
-
-    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(
-        mut self,
-        field_name: K,
-        field_value: V,
-    ) -> Self {
-        let field_name = field_name.as_ref();
-        if !FieldLines::is_reserved(field_name) {
-            self.field_lines.set(field_name, field_value.as_ref());
-        }
-        self
-    }
-
-    pub(crate) fn __add_header_internal<K: AsRef<str>, V: AsRef<str>>(
-        mut self,
-        field_name: K,
-        field_value: V,
-    ) -> Self {
-        self.field_lines
-            .set(field_name.as_ref(), field_value.as_ref());
-        self
-    }
-
-    pub fn remove_header<S: AsRef<str>>(mut self, field_name: S) -> Self {
-        let field_name = field_name.as_ref();
-        if !FieldLines::is_reserved(field_name) {
-            self.field_lines.remove(field_name);
-        }
-        self
-    }
-
-    pub(crate) fn __remove_header_internal<S: AsRef<str>>(mut self, field_name: S) -> Self {
-        self.field_lines.remove(field_name.as_ref());
-        self
-    }
-
-    pub fn add_cookie<K: Into<String>, V: Into<String>>(
-        mut self,
-        cookie_name: K,
-        cookie_value: V,
-        options: Option<CookieOptions>,
-    ) -> Self {
-        let cookie_store = self.cookies.get_or_insert_with(CookieStore::new);
-        cookie_store.set(cookie_name.into(), cookie_value.into(), options);
-        self
-    }
-
-    pub fn remove_cookie<K: Into<String>>(mut self, cookie_name: K) -> Self {
-        if let Some(cookie_store) = self.cookies.as_mut() {
-            cookie_store.remove(&cookie_name.into());
-        }
+        self.parts.on_sent = Some(hook);
         self
     }
 
     pub(crate) fn suppress_body(mut self) -> Self {
-        self.suppress_body = true;
+        self.parts.suppress_body = true;
         self
     }
-}
 
-pub struct HttpResponseInit<'a> {
-    pub(crate) connection: &'a RefCell<Connection>,
-    pub(crate) response: HttpResponse<HttpResponseBodyUnInitialized>,
-}
-
-impl<'a> HttpResponseInit<'a> {
     pub fn status_code(mut self, code: HttpStatus) -> Self {
-        self.response = self.response.status_code(code);
+        self.parts.status_code = code;
         self
     }
 
-    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(mut self, k: K, v: V) -> Self {
-        self.response = self.response.add_header(k, v);
-        self
+    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(self, k: K, v: V) -> Self {
+        if FieldLines::is_reserved(k.as_ref()) {
+            return self;
+        }
+        self.__add_header_internal(k, v)
     }
 
     pub(crate) fn __add_header_internal<K: AsRef<str>, V: AsRef<str>>(
@@ -531,17 +239,19 @@ impl<'a> HttpResponseInit<'a> {
         k: K,
         v: V,
     ) -> Self {
-        self.response = self.response.__add_header_internal(k, v);
+        self.parts.field_lines.set(k.as_ref(), v.as_ref());
         self
     }
 
-    pub fn remove_header<K: AsRef<str>>(mut self, name: K) -> Self {
-        self.response = self.response.remove_header(name);
-        self
+    pub fn remove_header<K: AsRef<str>>(self, k: K) -> Self {
+        if FieldLines::is_reserved(k.as_ref()) {
+            return self;
+        }
+        self.__remove_header_internal(k)
     }
 
-    pub(crate) fn __remove_header_internal<K: AsRef<str>>(mut self, name: K) -> Self {
-        self.response = self.response.__remove_header_internal(name);
+    pub(crate) fn __remove_header_internal<K: AsRef<str>>(mut self, k: K) -> Self {
+        self.parts.field_lines.remove(k.as_ref());
         self
     }
 
@@ -549,143 +259,203 @@ impl<'a> HttpResponseInit<'a> {
         mut self,
         name: K,
         value: V,
-        opts: Option<CookieOptions>,
+        options: Option<CookieOptions>,
     ) -> Self {
-        self.response = self.response.add_cookie(name, value, opts);
+        self.parts.cookies.get_or_insert_with(CookieStore::new).set(
+            name.into(),
+            value.into(),
+            options,
+        );
         self
     }
 
     pub fn remove_cookie<K: Into<String>>(mut self, name: K) -> Self {
-        self.response = self.response.remove_cookie(name);
+        if let Some(store) = self.parts.cookies.as_mut() {
+            store.remove(&name.into());
+        }
         self
     }
+}
 
-    pub fn json<V: crate::protocol::body::ToJson>(self, value: V) -> HttpResponseReady<'a> {
+impl<'a> HttpResponse<'a, Uninit> {
+    pub(crate) fn new<B: Into<Bytes>>(http_version: B, request_id: RequestId) -> Self {
+        Self::new_with_fields(http_version, request_id, FieldLines::with_capacity(6, 128))
+    }
+
+    pub(crate) fn new_with_fields<B: Into<Bytes>>(
+        http_version: B,
+        request_id: RequestId,
+        field_lines: FieldLines,
+    ) -> Self {
+        Self {
+            parts: ResponseParts {
+                http_version: http_version.into(),
+                request_id,
+                status_code: HttpStatus::Ok,
+                content_type: None,
+                content_length: None,
+                is_chunked: false,
+                body: None,
+                field_lines,
+                cookies: None,
+                suppress_body: false,
+                on_sent: None,
+                accept_encoding: None,
+            },
+            conn: None,
+            _state: PhantomData,
+        }
+    }
+
+    pub fn declare_trailers<S: AsRef<str>>(self, names: S) -> Self {
+        self.__add_header_internal("trailer", names)
+    }
+
+    /// `len == None` means chunked. Every body setter goes through here.
+    fn with_body<C: Into<Cow<'static, str>>>(
+        mut self,
+        body: Body,
+        content_type: C,
+        len: Option<u64>,
+    ) -> HttpResponse<'a, Ready> {
+        let p = &mut self.parts;
+        p.content_type = Some(content_type.into());
+        p.content_length = len;
+        p.is_chunked = len.is_none();
+        p.body = Some(body);
+        self.into_state()
+    }
+
+    fn pooled(self, buf: Vec<u8>, content_type: &'static str) -> HttpResponse<'a, Ready> {
+        let len = buf.len() as u64;
+        self.with_body(
+            Body::PooledVec {
+                bytes: buf,
+                content_type: None,
+            },
+            content_type,
+            Some(len),
+        )
+    }
+
+    pub fn json<V: crate::protocol::body::ToJson>(self, value: V) -> HttpResponse<'a, Ready> {
         let mut buf = WorkerScratch::take_body_buf();
         buf.clear();
         buf.reserve(value.size_hint());
         value.write_json(&mut buf);
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.into_pooled_body(buf, "application/json"),
-        }
+        self.pooled(buf, "application/json")
+    }
+
+    pub fn text<V: AsRef<str>>(self, v: V) -> HttpResponse<'a, Ready> {
+        let mut buf = WorkerScratch::take_body_buf();
+        buf.clear();
+        buf.extend_from_slice(v.as_ref().as_bytes());
+        self.pooled(buf, "text/plain")
     }
 
     pub fn bytes<V: Into<Bytes>, C: Into<Cow<'static, str>>>(
         self,
-        b: V,
+        bytes: V,
         ct: C,
-    ) -> HttpResponseReady<'a> {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.bytes(b, ct),
-        }
+    ) -> HttpResponse<'a, Ready> {
+        let bytes = bytes.into();
+        let len = bytes.len() as u64;
+        self.with_body(
+            Body::Bytes {
+                bytes,
+                content_type: None,
+            },
+            ct,
+            Some(len),
+        )
     }
 
-    pub fn text<V: AsRef<str>>(self, v: V) -> HttpResponseReady<'a> {
-        let mut buf = WorkerScratch::take_body_buf();
-        buf.clear();
-        buf.extend_from_slice(v.as_ref().as_bytes());
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.into_pooled_body(buf, "text/plain"),
-        }
+    pub fn empty(mut self) -> HttpResponse<'a, Ready> {
+        self.parts.body = None;
+        self.into_state()
     }
 
-    pub fn stream_from<S, C>(self, source: S, content_type: C) -> HttpResponseReady<'a>
+    pub fn stream_from<S, C>(self, source: S, ct: C) -> HttpResponse<'a, Ready>
     where
         S: crate::protocol::stream::IntoBodyStream + 'static,
         C: Into<Cow<'static, str>>,
     {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.stream_from(source, content_type),
-        }
+        self.chunk_stream(source, ct, None)
     }
 
-    pub fn stream_from_len<S, C>(
-        self,
-        source: S,
-        content_len: u64,
-        content_type: C,
-    ) -> HttpResponseReady<'a>
+    pub fn stream_from_len<S, C>(self, source: S, len: u64, ct: C) -> HttpResponse<'a, Ready>
     where
         S: crate::protocol::stream::IntoBodyStream + 'static,
         C: Into<Cow<'static, str>>,
     {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self
-                .response
-                .stream_from_len(source, content_len, content_type),
-        }
+        self.chunk_stream(source, ct, Some(len))
     }
 
-    pub fn stream_with<F, Fut, E, C>(self, content_type: C, producer: F) -> HttpResponseReady<'a>
+    fn chunk_stream<S, C>(self, source: S, ct: C, len: Option<u64>) -> HttpResponse<'a, Ready>
+    where
+        S: crate::protocol::stream::IntoBodyStream + 'static,
+        C: Into<Cow<'static, str>>,
+    {
+        let body = Body::ChunkStream {
+            source: Box::new(source.into_body_stream()),
+            content_length: len,
+        };
+        self.with_body(body, ct, len)
+    }
+
+    pub fn stream_with<F, Fut, E, C>(self, content_type: C, producer: F) -> HttpResponse<'a, Ready>
     where
         F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
         Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
         C: Into<Cow<'static, str>>,
     {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.stream_with(content_type, producer),
-        }
+        let (tx, rx) = crate::protocol::stream::stream_channel(16);
+        let handle = tokio::task::spawn_local(async move {
+            let err_tx = tx.clone();
+            if let Err(err) = producer(tx).await {
+                err_tx.apply_error(err).await;
+            }
+        });
+        let body = Body::ChunkStream {
+            source: Box::new(crate::protocol::stream::ManagedStreamSource {
+                inner: rx,
+                handle: Some(handle),
+            }),
+            content_length: None,
+        };
+        self.with_body(body, content_type, None)
     }
 
-    pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponseReady<'a>
+    pub fn sse<F, Fut, E>(self, producer: F) -> HttpResponse<'a, Ready>
     where
         F: FnOnce(crate::protocol::stream::StreamSender) -> Fut + 'static,
         Fut: Future<Output = Result<(), E>> + 'static,
         E: crate::protocol::stream::StreamError,
     {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.sse(producer),
-        }
-    }
-    pub fn empty(self) -> HttpResponseReady<'a> {
-        HttpResponseReady {
-            connection: self.connection,
-            response: self.response.empty(),
-        }
+        self.__add_header_internal("cache-control", "no-cache")
+            .stream_with("text/event-stream", producer)
     }
 }
 
-pub struct HttpResponseReady<'a> {
-    pub(crate) connection: &'a RefCell<Connection>,
-    pub(crate) response: HttpResponse<HttpResponseBodyInitialized>,
-}
-
-impl<'a> HttpResponseReady<'a> {
-    pub fn status_code(mut self, code: HttpStatus) -> Self {
-        self.response = self.response.status_code(code);
-        self
-    }
-
-    pub fn add_header<K: AsRef<str>, V: AsRef<str>>(mut self, k: K, v: V) -> Self {
-        self.response = self.response.add_header(k, v);
-        self
-    }
-
+impl<'a> HttpResponse<'a, Ready> {
     pub async fn compress(mut self) -> Self {
-        self.response = self.response.compress().await;
+        self.parts.compress().await;
         self
     }
 
     pub async fn failable_send(self) -> Result<(), std::io::Error> {
-        let mut conn = self.connection.try_borrow_mut().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+        let cell = self
+            .conn
+            .ok_or_else(|| std::io::Error::other("response is not attached to a connection"))?;
+        let mut conn = cell.try_borrow_mut().map_err(|_| {
+            std::io::Error::other(
                 "connection is already in use (concurrent response on the same HttpCall)",
             )
         })?;
-
-        conn.write_response(self.response).await
+        conn.write_response(self.parts).await
     }
 
-    #[allow(clippy::await_holding_refcell_ref)]
     pub async fn send(self) {
         let _ = self.failable_send().await;
     }

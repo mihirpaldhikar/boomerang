@@ -34,10 +34,7 @@ pub(crate) use field_lines::FieldLines;
 pub use method::HttpMethod;
 pub(crate) use request::{BodyState, HttpParam, HttpRequest, HttpRequestError};
 pub use request::{IpCidr, ProxyHeaderMode, TrustedProxies};
-pub(crate) use response::{
-    HttpResponse, HttpResponseBodyInitialized, HttpResponseBodyUnInitialized, HttpResponseInit,
-    ResponseHook,
-};
+pub(crate) use response::{HttpResponse, ResponseHook, ResponseParts, Uninit};
 pub use status::HttpStatus;
 pub(crate) use stream::StreamPoll;
 pub use stream::{

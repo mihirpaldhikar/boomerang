@@ -20,10 +20,7 @@
  * SOFTWARE.
  */
 
-use crate::protocol::{
-    Body, FieldLines, HttpRequest, HttpRequestError, HttpResponse, HttpResponseBodyInitialized,
-    HttpStatus,
-};
+use crate::protocol::{Body, FieldLines, HttpRequest, HttpRequestError, HttpStatus, ResponseParts};
 use crate::server::transport::Transport;
 use bytes::BytesMut;
 use std::cell::RefCell;
@@ -549,7 +546,7 @@ impl Connection {
 
     pub(crate) async fn write_response(
         &mut self,
-        response: HttpResponse<HttpResponseBodyInitialized>,
+        response: ResponseParts,
     ) -> Result<(), tokio::io::Error> {
         self.has_written_response = true;
 

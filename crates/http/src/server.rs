@@ -29,8 +29,7 @@ mod transport;
 
 use crate::cors::Cors;
 use crate::protocol::{
-    HttpMethod, HttpRequestError, HttpResponse, HttpResponseBodyUnInitialized, HttpStatus,
-    TrustedProxies,
+    HttpMethod, HttpRequestError, HttpResponse, HttpStatus, TrustedProxies, Uninit,
 };
 use crate::router::Router;
 use crate::server::per_core::set_current_worker_id;
@@ -1182,7 +1181,8 @@ impl HttpServer {
                     .write_response(
                         HttpResponse::new(Bytes::from_static(b"HTTP/1.1"), request_id)
                             .status_code(status)
-                            .empty(),
+                            .empty()
+                            .into_parts(),
                     )
                     .await;
                 let _ = stream.shutdown().await;
@@ -1303,7 +1303,11 @@ impl HttpServer {
                         .add_header("allow", allow);
                 }
 
-                let _ = call.connection.get_mut().write_response(resp.empty()).await;
+                let _ = call
+                    .connection
+                    .get_mut()
+                    .write_response(resp.empty().into_parts())
+                    .await;
                 return self.finish(call, keep_alive).await;
             }
         };
@@ -1320,11 +1324,11 @@ impl HttpServer {
         self.finish(call, keep_alive).await
     }
 
-    fn apply_cors_to_uninit(
+    fn apply_cors_to_uninit<'a>(
         &self,
         call: &HttpCall,
-        resp: HttpResponse<HttpResponseBodyUnInitialized>,
-    ) -> HttpResponse<HttpResponseBodyUnInitialized> {
+        resp: HttpResponse<'a, Uninit>,
+    ) -> HttpResponse<'a, Uninit> {
         match &self.cors {
             Some(cors) => cors.add_cors_headers(call, resp),
             None => resp,
