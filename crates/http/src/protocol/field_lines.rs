@@ -31,32 +31,38 @@ const SLOT_ORIGIN: usize = 6;
 const SLOT_COOKIE: usize = 7;
 const SLOT_EXPECT: usize = 8;
 const SLOT_AC_REQ_METHOD: usize = 9;
+const SLOT_FORWARDED: usize = 10;
+const SLOT_X_REAL_IP: usize = 11;
+const SLOT_X_FORWARDED_FOR: usize = 12;
+const SLOT_CF_CONNECTING_IP: usize = 13;
+const SLOT_COUNT: usize = 14;
+
+const NO_FIELD: u16 = u16::MAX;
+const MAX_HEADER_LINES: usize = 100;
 
 const TCHAR_TABLE: [bool; 256] = {
     let mut t = [false; 256];
     let mut i = 0usize;
     while i < 256 {
         let b = i as u8;
-        t[i] = matches!(
-            b,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-                | b'0'..=b'9'
-                | b'A'..=b'Z'
-                | b'a'..=b'z'
-        );
+        t[i] = b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+            );
         i += 1;
     }
     t
@@ -64,57 +70,73 @@ const TCHAR_TABLE: [bool; 256] = {
 
 #[inline]
 fn known_slot(name: &[u8]) -> Option<usize> {
+    let is = |s: &[u8]| name.eq_ignore_ascii_case(s);
     match name.len() {
-        4 if name.eq_ignore_ascii_case(b"host") => Some(SLOT_HOST),
-        6 => {
-            if name.eq_ignore_ascii_case(b"origin") {
-                Some(SLOT_ORIGIN)
-            } else if name.eq_ignore_ascii_case(b"cookie") {
-                Some(SLOT_COOKIE)
-            } else if name.eq_ignore_ascii_case(b"expect") {
-                Some(SLOT_EXPECT)
-            } else {
-                None
-            }
-        }
-        10 if name.eq_ignore_ascii_case(b"connection") => Some(SLOT_CONNECTION),
-        12 if name.eq_ignore_ascii_case(b"content-type") => Some(SLOT_CONTENT_TYPE),
-        14 if name.eq_ignore_ascii_case(b"content-length") => Some(SLOT_CONTENT_LENGTH),
-        15 if name.eq_ignore_ascii_case(b"accept-encoding") => Some(SLOT_ACCEPT_ENCODING),
-        17 if name.eq_ignore_ascii_case(b"transfer-encoding") => Some(SLOT_TRANSFER_ENCODING),
-        29 if name.eq_ignore_ascii_case(b"access-control-request-method") => {
-            Some(SLOT_AC_REQ_METHOD)
-        }
+        4 if is(b"host") => Some(SLOT_HOST),
+        6 if is(b"origin") => Some(SLOT_ORIGIN),
+        6 if is(b"cookie") => Some(SLOT_COOKIE),
+        6 if is(b"expect") => Some(SLOT_EXPECT),
+        9 if is(b"forwarded") => Some(SLOT_FORWARDED),
+        9 if is(b"x-real-ip") => Some(SLOT_X_REAL_IP),
+        10 if is(b"connection") => Some(SLOT_CONNECTION),
+        12 if is(b"content-type") => Some(SLOT_CONTENT_TYPE),
+        14 if is(b"content-length") => Some(SLOT_CONTENT_LENGTH),
+        15 if is(b"accept-encoding") => Some(SLOT_ACCEPT_ENCODING),
+        15 if is(b"x-forwarded-for") => Some(SLOT_X_FORWARDED_FOR),
+        16 if is(b"cf-connecting-ip") => Some(SLOT_CF_CONNECTING_IP),
+        17 if is(b"transfer-encoding") => Some(SLOT_TRANSFER_ENCODING),
+        29 if is(b"access-control-request-method") => Some(SLOT_AC_REQ_METHOD),
         _ => None,
     }
 }
 
 #[inline(always)]
 fn header_bloom_bit(name: &[u8]) -> u64 {
-    let h = ((name.len()).wrapping_mul(31)) ^ (name[0].to_ascii_lowercase() as usize);
+    let h = name.len().wrapping_mul(31) ^ usize::from(name[0].to_ascii_lowercase());
     1u64 << (h & 63)
+}
+
+#[inline]
+fn trim_ows(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = s {
+        s = rest;
+    }
+    s
+}
+
+fn parse_error(msg: &'static str) -> HttpRequestError {
+    HttpRequestError::HeaderParsingFailed(msg.into())
+}
+
+#[derive(Clone, Copy)]
+struct Field {
+    name_start: u32,
+    name_len: u32,
+    value_start: u32,
+    value_len: u32,
 }
 
 pub(crate) struct FieldLines {
     arena: Vec<u8>,
-    headers: Vec<(u32, u32, u32, u32)>,
-    known: [u16; 10],
+    headers: Vec<Field>,
+    known: [u16; SLOT_COUNT],
 }
 
 impl Default for FieldLines {
     fn default() -> Self {
-        Self {
-            arena: Vec::new(),
-            headers: Vec::new(),
-            known: [u16::MAX; 10],
-        }
+        Self::with_capacity(0, 0)
     }
 }
 
 impl From<&[u8]> for FieldLines {
     fn from(bytes: &[u8]) -> Self {
         let mut fl = Self::with_capacity(16, bytes.len());
-        let _ = fl.parse_into(bytes);
+        if fl.parse_into(bytes).is_err() {
+            fl.clear();
+        }
         fl
     }
 }
@@ -122,42 +144,31 @@ impl From<&[u8]> for FieldLines {
 impl FieldLines {
     #[inline]
     pub(crate) fn is_reserved(name: &str) -> bool {
+        let is = |s: &str| name.eq_ignore_ascii_case(s);
         match name.len() {
-            4 => name.eq_ignore_ascii_case("date"),
-            6 => name.eq_ignore_ascii_case("cookie"),
-            10 => {
-                name.eq_ignore_ascii_case("set-cookie")
-                    || name.eq_ignore_ascii_case("connection")
-                    || name.eq_ignore_ascii_case("keep-alive")
-            }
-            12 => {
-                name.eq_ignore_ascii_case("content-type")
-                    || name.eq_ignore_ascii_case("x-request-id")
-            }
-            13 => {
-                name.eq_ignore_ascii_case("content-range")
-                    || name.eq_ignore_ascii_case("accept-ranges")
-            }
-            14 => name.eq_ignore_ascii_case("content-length"),
-            15 => name.eq_ignore_ascii_case("accept-encoding"),
-            17 => name.eq_ignore_ascii_case("transfer-encoding"),
-            22 => name.eq_ignore_ascii_case("access-control-max-age"),
-            27 => name.eq_ignore_ascii_case("access-control-allow-origin"),
-            28 => name.eq_ignore_ascii_case("access-control-allow-methods"),
-            29 => name.eq_ignore_ascii_case("access-control-expose-headers"),
-            30 => name.eq_ignore_ascii_case("access-control-request-headers"),
-            32 => name.eq_ignore_ascii_case("access-control-allow-credentials"),
+            4 => is("date"),
+            6 => is("cookie"),
+            10 => is("set-cookie") || is("connection") || is("keep-alive"),
+            12 => is("content-type") || is("x-request-id"),
+            13 => is("content-range") || is("accept-ranges"),
+            14 => is("content-length"),
+            15 => is("accept-encoding"),
+            17 => is("transfer-encoding"),
+            22 => is("access-control-max-age"),
+            27 => is("access-control-allow-origin"),
+            28 => is("access-control-allow-methods") || is("access-control-allow-headers"),
+            29 => is("access-control-expose-headers"),
+            30 => is("access-control-request-headers"),
+            32 => is("access-control-allow-credentials"),
             _ => false,
         }
     }
-}
 
-impl FieldLines {
     pub(crate) fn with_capacity(headers_cap: usize, arena_cap: usize) -> Self {
         Self {
             arena: Vec::with_capacity(arena_cap),
             headers: Vec::with_capacity(headers_cap),
-            known: [u16::MAX; 10],
+            known: [NO_FIELD; SLOT_COUNT],
         }
     }
 
@@ -165,7 +176,7 @@ impl FieldLines {
     pub(crate) fn clear(&mut self) {
         self.arena.clear();
         self.headers.clear();
-        self.known = [u16::MAX; 10];
+        self.known = [NO_FIELD; SLOT_COUNT];
     }
 
     #[inline]
@@ -176,21 +187,8 @@ impl FieldLines {
     pub(crate) fn parse_into(&mut self, bytes: &[u8]) -> Result<(), HttpRequestError> {
         self.clear();
 
-        #[inline(always)]
-        fn trim_ows(mut s: &[u8]) -> &[u8] {
-            while !s.is_empty() && (s[0] == b' ' || s[0] == b'\t') {
-                s = &s[1..];
-            }
-            while !s.is_empty() && (s[s.len() - 1] == b' ' || s[s.len() - 1] == b'\t') {
-                s = &s[..s.len() - 1];
-            }
-            s
-        }
-
         if !bytes.ends_with(b"\r\n") {
-            return Err(HttpRequestError::HeaderParsingFailed(
-                "Headers missing CRLF terminator".into(),
-            ));
+            return Err(parse_error("headers missing CRLF terminator"));
         }
         let end = bytes.len() - 2;
         if end == 0 {
@@ -200,260 +198,231 @@ impl FieldLines {
         let all_ascii = bytes[..end].is_ascii();
         self.arena.reserve(end);
 
-        let mut seen_mask: u64 = 0;
+        let mut seen_mask = 0u64;
+        let mut lines = 0usize;
         let mut i = 0;
         while i < end {
             let line_end = memchr::memchr(b'\n', &bytes[i..end])
                 .map(|off| i + off)
-                .ok_or_else(|| {
-                    HttpRequestError::HeaderParsingFailed("Header line missing LF".into())
-                })?;
+                .ok_or_else(|| parse_error("header line missing LF"))?;
 
             if line_end == i || bytes[line_end - 1] != b'\r' {
-                return Err(HttpRequestError::HeaderParsingFailed(
-                    "Bare LF in headers".into(),
-                ));
+                return Err(parse_error("bare LF in headers"));
             }
 
             let line = &bytes[i..line_end - 1];
+            i = line_end + 1;
             if line.is_empty() {
-                i = line_end + 1;
-                continue;
+                return Err(parse_error("unexpected empty header line"));
             }
 
-            let colon_pos = memchr::memchr(b':', line).ok_or_else(|| {
-                HttpRequestError::HeaderParsingFailed("Header missing colon".into())
-            })?;
-
-            let name_bytes = &line[..colon_pos];
-            if !is_valid_header_name(name_bytes) {
-                return Err(HttpRequestError::HeaderParsingFailed(
-                    "Invalid header name".into(),
-                ));
+            lines += 1;
+            if lines > MAX_HEADER_LINES {
+                return Err(HttpRequestError::HeadersTooLarge);
             }
 
-            let val_bytes = trim_ows(&line[colon_pos + 1..]);
-            if has_invalid_header_bytes(val_bytes) {
-                return Err(HttpRequestError::HeaderParsingFailed(
-                    "Invalid control byte in header value".into(),
-                ));
-            }
-            if !all_ascii && std::str::from_utf8(val_bytes).is_err() {
-                return Err(HttpRequestError::HeaderParsingFailed(
-                    "Invalid UTF-8 in header value".into(),
-                ));
+            let colon =
+                memchr::memchr(b':', line).ok_or_else(|| parse_error("header missing colon"))?;
+
+            let name = &line[..colon];
+            if !is_valid_header_name(name) {
+                return Err(parse_error("invalid header name"));
             }
 
-            let name_len = name_bytes.len() as u32;
-            let slot = known_slot(name_bytes);
+            let value = trim_ows(&line[colon + 1..]);
+            if has_invalid_header_bytes(value) {
+                return Err(parse_error("invalid control byte in header value"));
+            }
+            if !all_ascii && std::str::from_utf8(value).is_err() {
+                return Err(parse_error("invalid UTF-8 in header value"));
+            }
 
-            let existing_idx = if let Some(s) = slot {
-                let idx = self.known[s];
-                if idx != u16::MAX {
-                    Some(idx as usize)
-                } else {
-                    None
-                }
-            } else {
-                let bit = header_bloom_bit(name_bytes);
-                if (seen_mask & bit) != 0 {
-                    self.headers.iter().position(|&(np, nl, _, _)| {
-                        nl == name_len
-                            && self.arena[np as usize..(np + nl) as usize]
-                                .eq_ignore_ascii_case(name_bytes)
-                    })
-                } else {
+            let slot = known_slot(name);
+            let existing = match slot {
+                Some(s) => self.known_index(s),
+                None => {
+                    let bit = header_bloom_bit(name);
+                    let maybe_seen = seen_mask & bit != 0;
                     seen_mask |= bit;
-                    None
+                    if maybe_seen { self.scan(name) } else { None }
                 }
             };
 
-            if let Some(idx) = existing_idx {
-                let (_, _, vp, vl) = self.headers[idx];
-                let old_vp = vp as usize;
-                let old_vl = vl as usize;
-
-                let new_vp = self.arena.len() as u32;
-                self.arena.reserve(old_vl + 2 + val_bytes.len());
-                self.arena.extend_from_within(old_vp..old_vp + old_vl);
-                self.arena.extend_from_slice(b", ");
-                self.arena.extend_from_slice(val_bytes);
-
-                self.headers[idx].2 = new_vp;
-                self.headers[idx].3 = self.arena.len() as u32 - new_vp;
-            } else {
-                let new_idx = self.headers.len();
-                let np = self.arena.len() as u32;
-                self.arena.extend_from_slice(name_bytes);
-                self.arena[np as usize..].make_ascii_lowercase();
-
-                let vp = self.arena.len() as u32;
-                self.arena.extend_from_slice(val_bytes);
-
-                self.headers
-                    .push((np, name_len, vp, self.arena.len() as u32 - vp));
-
-                if let Some(s) = slot {
-                    if new_idx < u16::MAX as usize {
-                        self.known[s] = new_idx as u16;
+            match existing {
+                None => self.insert(slot, name, value),
+                Some(idx) => match slot {
+                    Some(SLOT_HOST | SLOT_CONTENT_LENGTH) => {
+                        return Err(parse_error("duplicate Host or Content-Length header"));
                     }
-                }
+                    Some(SLOT_COOKIE) => self.append_value(idx, b"; ", value),
+                    _ => self.append_value(idx, b", ", value),
+                },
             }
-
-            i = line_end + 1;
         }
 
         Ok(())
     }
 
     pub(crate) fn set<K: AsRef<str>, V: AsRef<str>>(&mut self, key: K, value: V) {
-        let key_bytes = key.as_ref().as_bytes();
-        let val_bytes = value.as_ref().as_bytes();
+        let name = key.as_ref().as_bytes();
+        let value = value.as_ref().as_bytes();
 
-        if !is_valid_header_name(key_bytes) || has_invalid_header_bytes(val_bytes) {
+        if !is_valid_header_name(name) || has_invalid_header_bytes(value) {
             return;
         }
 
-        let key_len = key_bytes.len() as u32;
-        let slot = known_slot(key_bytes);
-
-        let existing_idx = if let Some(s) = slot {
-            let idx = self.known[s];
-            if idx != u16::MAX {
-                Some(idx as usize)
-            } else {
-                None
-            }
-        } else {
-            self.headers.iter().position(|&(np, nl, _, _)| {
-                nl == key_len
-                    && self.arena[np as usize..(np + nl) as usize].eq_ignore_ascii_case(key_bytes)
-            })
+        let slot = known_slot(name);
+        let existing = match slot {
+            Some(s) => self.known_index(s),
+            None => self.scan(name),
         };
 
-        if let Some(idx) = existing_idx {
-            let (_, _, vp, vl) = self.headers[idx];
-            let old_vp = vp as usize;
-            let old_vl = vl as usize;
-
-            let new_vp = self.arena.len() as u32;
-            self.arena.reserve(old_vl + 2 + val_bytes.len());
-            self.arena.extend_from_within(old_vp..old_vp + old_vl);
-            self.arena.extend_from_slice(b", ");
-            self.arena.extend_from_slice(val_bytes);
-
-            let new_vl = self.arena.len() as u32 - new_vp;
-            self.headers[idx].2 = new_vp;
-            self.headers[idx].3 = new_vl;
-        } else {
-            let new_idx = self.headers.len();
-            let np = self.arena.len() as u32;
-            self.arena.reserve(key_bytes.len() + val_bytes.len());
-            self.arena.extend_from_slice(key_bytes);
-            self.arena[np as usize..].make_ascii_lowercase();
-
-            let vp = self.arena.len() as u32;
-            self.arena.extend_from_slice(val_bytes);
-            let vl = val_bytes.len() as u32;
-
-            self.headers.push((np, key_len, vp, vl));
-
-            if let Some(s) = slot {
-                if new_idx < u16::MAX as usize {
-                    self.known[s] = new_idx as u16;
-                }
-            }
+        match existing {
+            Some(idx) => self.append_value(idx, b", ", value),
+            None => self.insert(slot, name, value),
         }
     }
 
     #[inline]
     pub(crate) fn get(&self, key: &str) -> Option<&str> {
-        let key_bytes = key.as_bytes();
-        if let Some(slot) = known_slot(key_bytes) {
-            let idx = self.known[slot];
-            if idx == u16::MAX {
-                return None;
-            }
-            let (_, _, vp, vl) = self.headers[idx as usize];
-            return Some(unsafe {
-                std::str::from_utf8_unchecked(&self.arena[vp as usize..(vp + vl) as usize])
-            });
-        }
-
-        let key_len = key_bytes.len() as u32;
-        for &(np, nl, vp, vl) in &self.headers {
-            if nl == key_len {
-                let name = &self.arena[np as usize..(np + nl) as usize];
-                if name.eq_ignore_ascii_case(key_bytes) {
-                    return Some(unsafe {
-                        std::str::from_utf8_unchecked(&self.arena[vp as usize..(vp + vl) as usize])
-                    });
-                }
-            }
-        }
-        None
+        self.find(key.as_bytes())
+            .map(|idx| self.value(self.headers[idx]))
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> Option<String> {
-        let key_bytes = key.as_bytes();
-        let idx = if let Some(s) = known_slot(key_bytes) {
-            let i = self.known[s];
-            if i == u16::MAX {
-                return None;
-            }
-            i as usize
-        } else {
-            let key_len = key_bytes.len() as u32;
-            self.headers.iter().position(|&(np, nl, _, _)| {
-                nl == key_len
-                    && self.arena[np as usize..(np + nl) as usize].eq_ignore_ascii_case(key_bytes)
-            })?
-        };
+        let idx = self.find(key.as_bytes())?;
+        let field = self.headers.remove(idx);
 
-        let (_, _, vp, vl) = self.headers.remove(idx);
         for slot in &mut self.known {
-            if *slot == idx as u16 {
-                *slot = u16::MAX;
-            } else if *slot != u16::MAX && (*slot as usize) > idx {
-                *slot -= 1;
+            if *slot == NO_FIELD {
+                continue;
+            }
+            match usize::from(*slot) {
+                i if i == idx => *slot = NO_FIELD,
+                i if i > idx => *slot -= 1,
+                _ => {}
             }
         }
 
-        String::from_utf8(self.arena[vp as usize..(vp + vl) as usize].to_vec()).ok()
+        Some(self.value(field).to_owned())
     }
 
     pub(crate) fn to_bytes(&self) -> bytes::Bytes {
-        let mut total_size = 0;
-        for &(_, nl, _, vl) in &self.headers {
-            total_size += nl as usize + vl as usize + 4;
-        }
+        let total: usize = self
+            .headers
+            .iter()
+            .map(|f| f.name_len as usize + f.value_len as usize + 4)
+            .sum();
 
-        let mut buf = bytes::BytesMut::with_capacity(total_size);
-        for &(np, nl, vp, vl) in &self.headers {
-            buf.extend_from_slice(&self.arena[np as usize..(np + nl) as usize]);
+        let mut buf = bytes::BytesMut::with_capacity(total);
+        for (name, value) in self.iter() {
+            buf.extend_from_slice(name.as_bytes());
             buf.extend_from_slice(b": ");
-            buf.extend_from_slice(&self.arena[vp as usize..(vp + vl) as usize]);
+            buf.extend_from_slice(value.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
         buf.freeze()
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.headers.iter().map(move |&(np, nl, vp, vl)| {
-            let k = unsafe {
-                std::str::from_utf8_unchecked(&self.arena[np as usize..(np + nl) as usize])
-            };
-            let v = unsafe {
-                std::str::from_utf8_unchecked(&self.arena[vp as usize..(vp + vl) as usize])
-            };
-            (k, v)
+        self.headers
+            .iter()
+            .map(move |&f| (self.name(f), self.value(f)))
+    }
+
+    #[inline]
+    fn name_bytes(&self, f: Field) -> &[u8] {
+        &self.arena[f.name_start as usize..(f.name_start + f.name_len) as usize]
+    }
+
+    #[inline]
+    fn name(&self, f: Field) -> &str {
+        // SAFETY: `insert` only receives validated token names, which are ASCII.
+        unsafe { std::str::from_utf8_unchecked(self.name_bytes(f)) }
+    }
+
+    #[inline]
+    fn value(&self, f: Field) -> &str {
+        let range = f.value_start as usize..(f.value_start + f.value_len) as usize;
+        // SAFETY: every value comes from a `&str` or was UTF-8 checked by the parser,
+        // and joining values with ASCII separators keeps it valid.
+        unsafe { std::str::from_utf8_unchecked(&self.arena[range]) }
+    }
+
+    #[inline]
+    fn known_index(&self, slot: usize) -> Option<usize> {
+        let idx = self.known[slot];
+        (idx != NO_FIELD).then_some(usize::from(idx))
+    }
+
+    #[inline]
+    fn scan(&self, name: &[u8]) -> Option<usize> {
+        self.headers.iter().position(|&f| {
+            f.name_len as usize == name.len() && self.name_bytes(f).eq_ignore_ascii_case(name)
         })
+    }
+
+    #[inline]
+    fn find(&self, name: &[u8]) -> Option<usize> {
+        match known_slot(name) {
+            Some(slot) => self.known_index(slot),
+            None => self.scan(name),
+        }
+    }
+
+    fn insert(&mut self, slot: Option<usize>, name: &[u8], value: &[u8]) {
+        self.arena.reserve(name.len() + value.len());
+        let idx = self.headers.len();
+
+        let name_start = self.arena.len();
+        self.arena.extend_from_slice(name);
+        self.arena[name_start..].make_ascii_lowercase();
+
+        let value_start = self.arena.len();
+        self.arena.extend_from_slice(value);
+
+        self.headers.push(Field {
+            name_start: name_start as u32,
+            name_len: name.len() as u32,
+            value_start: value_start as u32,
+            value_len: value.len() as u32,
+        });
+
+        if let Some(s) = slot
+            && idx < usize::from(NO_FIELD)
+        {
+            self.known[s] = idx as u16;
+        }
+    }
+
+    fn append_value(&mut self, idx: usize, sep: &[u8], value: &[u8]) {
+        let field = self.headers[idx];
+        let len = field.value_len as usize;
+        let mut start = field.value_start as usize;
+
+        let extra = if start + len != self.arena.len() {
+            len + sep.len() + value.len()
+        } else {
+            sep.len() + value.len()
+        };
+        self.arena.reserve(extra);
+
+        if start + len != self.arena.len() {
+            let new_start = self.arena.len();
+            self.arena.extend_from_within(start..start + len);
+            start = new_start;
+        }
+        self.arena.extend_from_slice(sep);
+        self.arena.extend_from_slice(value);
+
+        self.headers[idx].value_start = start as u32;
+        self.headers[idx].value_len = (self.arena.len() - start) as u32;
     }
 }
 
 #[inline]
 pub(crate) fn is_valid_header_name(bytes: &[u8]) -> bool {
-    !bytes.is_empty() && bytes.iter().all(|&b| TCHAR_TABLE[b as usize])
+    !bytes.is_empty() && bytes.iter().all(|&b| TCHAR_TABLE[usize::from(b)])
 }
 
 #[inline]
