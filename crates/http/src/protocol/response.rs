@@ -370,6 +370,18 @@ impl<'a> HttpResponse<'a, Uninit> {
         )
     }
 
+    pub fn download<V: Into<Bytes>, C: Into<Cow<'static, str>>>(
+        self,
+        bytes: V,
+        filename: &str,
+        content_type: C,
+    ) -> HttpResponse<'a, Ready> {
+        let cd = format_content_disposition(filename);
+        self.add_header("content-disposition", cd)
+            .add_header("x-content-type-options", "nosniff")
+            .bytes(bytes, content_type)
+    }
+
     pub fn empty(mut self) -> HttpResponse<'a, Ready> {
         self.parts.body = None;
         self.into_state()
@@ -459,4 +471,46 @@ impl<'a> HttpResponse<'a, Ready> {
     pub async fn send(self) {
         let _ = self.failable_send().await;
     }
+}
+
+fn format_content_disposition(filename: &str) -> String {
+    let base = filename.rsplit(['/', '\\']).next().unwrap_or("download");
+    let mut ascii_safe = String::with_capacity(base.len());
+    let mut has_non_ascii = false;
+
+    for ch in base.chars() {
+        if ch.is_control() || ch == '\0' {
+            continue;
+        }
+        if ch.is_ascii() {
+            ascii_safe.push(if ch == '"' { '_' } else { ch });
+        } else {
+            has_non_ascii = true;
+            ascii_safe.push('_');
+        }
+    }
+    if ascii_safe.is_empty() {
+        ascii_safe.push_str("download");
+    }
+
+    if !has_non_ascii {
+        return format!(r#"attachment; filename="{ascii_safe}""#);
+    }
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut utf8_pct = String::with_capacity(base.len() * 3);
+    for &b in base.as_bytes() {
+        if b < 0x20 || b == 0x7F {
+            continue;
+        }
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            utf8_pct.push(b as char);
+        } else {
+            utf8_pct.push('%');
+            utf8_pct.push(HEX[(b >> 4) as usize] as char);
+            utf8_pct.push(HEX[(b & 0xF) as usize] as char);
+        }
+    }
+
+    format!(r#"attachment; filename="{ascii_safe}"; filename*=UTF-8''{utf8_pct}"#)
 }
