@@ -24,22 +24,28 @@ use crate::core::{
     Action, DatabaseSchema, DatabaseSchemaBuilder, Ident, Lit, RawForeignKey, RawIndex, RawIndexKey,
 };
 use futures::TryStreamExt;
+use http::{CachePadded, worker_id};
 use sqlx::AssertSqlSafe;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 
 const DATABASE_SCHEMA_QUERY: &'static str =
     include_str!("../../../../../sql/dialect/postgres/database_schema.sql");
 
 pub struct PostgresDatabase {
-    pool: sqlx::Pool<sqlx::Postgres>,
+    connection_url: Arc<str>,
+    max_conns_per_core: u32,
+    core_pools: Arc<[CachePadded<OnceCell<sqlx::PgPool>>]>,
     schema: Arc<DatabaseSchema>,
 }
 
 impl Clone for PostgresDatabase {
     fn clone(&self) -> Self {
         Self {
-            pool: self.pool.clone(),
+            connection_url: Arc::clone(&self.connection_url),
+            max_conns_per_core: self.max_conns_per_core,
+            core_pools: Arc::clone(&self.core_pools),
             schema: Arc::clone(&self.schema),
         }
     }
@@ -47,42 +53,70 @@ impl Clone for PostgresDatabase {
 
 impl PostgresDatabase {
     pub async fn new(connection_url: &str) -> Result<Self, DatabaseError> {
-        let pool = PgPoolOptions::new()
+        let setup_pool = PgPoolOptions::new()
+            .max_connections(1)
             .connect(connection_url)
             .await
             .map_err(|_| DatabaseError::ConnectionPoolFailed)?;
 
-        let mut tx = pool
+        let mut tx = setup_pool
             .begin()
             .await
             .map_err(|_| DatabaseError::FailedToAcquireTransaction)?;
 
         Self::perform_setup(&mut tx).await?;
-
         let schema = Self::load_schema(&mut tx).await?;
 
         sqlx::query("SET LOCAL boomerang.sync_write = 'true'")
             .execute(&mut *tx)
             .await
-            .map_err(|err| DatabaseError::SqlxError(err))?;
+            .map_err(DatabaseError::SqlxError)?;
 
         Self::backfill_sync_logs(&schema, &mut tx).await?;
-
         Self::setup_triggers(&schema, &mut tx).await?;
 
         tx.commit()
             .await
             .map_err(|_| DatabaseError::FailedToCommitTransaction)?;
 
+        setup_pool.close().await;
+
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let core_pools: Vec<CachePadded<OnceCell<sqlx::PgPool>>> =
+            (0..cores).map(|_| CachePadded(OnceCell::new())).collect();
+
+        let max_conns_per_core = (32 / cores.max(1)).clamp(2, 8) as u32;
+
         Ok(Self {
-            pool,
+            connection_url: Arc::from(connection_url),
+            max_conns_per_core,
+            core_pools: Arc::from(core_pools),
             schema: Arc::new(schema),
         })
     }
 
+    #[inline]
+    pub async fn pool(&self) -> Result<&sqlx::PgPool, DatabaseError> {
+        let idx = worker_id().unwrap_or(0) % self.core_pools.len();
+        self.core_pools[idx]
+            .0
+            .get_or_try_init(|| async {
+                PgPoolOptions::new()
+                    .max_connections(self.max_conns_per_core)
+                    .connect(&self.connection_url)
+                    .await
+                    .map_err(|_| DatabaseError::ConnectionPoolFailed)
+            })
+            .await
+    }
+
     pub async fn identity(&self) -> Result<[u8; 32], DatabaseError> {
+        let pool = self.pool().await?;
         let bytes: Vec<u8> = sqlx::query_scalar("SELECT identity FROM boomerang.meta()")
-            .fetch_one(&self.pool)
+            .fetch_one(pool)
             .await
             .map_err(DatabaseError::SqlxError)?;
         bytes
@@ -95,8 +129,8 @@ impl PostgresDatabase {
     }
 
     pub async fn remove_setup(&self) -> Result<(), DatabaseError> {
-        let mut tx = self
-            .pool
+        let pool = self.pool().await?;
+        let mut tx = pool
             .begin()
             .await
             .map_err(|_| DatabaseError::FailedToAcquireTransaction)?;

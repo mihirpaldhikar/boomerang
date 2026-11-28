@@ -22,7 +22,9 @@
 use crate::cli::{Cli, Commands};
 use crate::config::BoomerangConfig;
 use clap::{CommandFactory, Parser};
+use database::PostgresDatabase;
 use http::HttpServer;
+use std::sync::OnceLock;
 
 mod cli;
 mod config;
@@ -30,6 +32,7 @@ mod routes;
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static POSTGRES: OnceLock<PostgresDatabase> = OnceLock::new();
 
 #[tokio::main]
 async fn main() {
@@ -67,8 +70,10 @@ async fn main() {
         }
     };
 
-    let pg = match database::PostgresDatabase::new(cfg.database.url).await {
-        Ok(pg) => pg,
+    match PostgresDatabase::new(cfg.database.url).await {
+        Ok(pg) => {
+            _ = POSTGRES.set(pg);
+        }
         Err(e) => {
             eprintln!("database error: {}", e.to_string());
             std::process::exit(1);
@@ -89,10 +94,14 @@ async fn main() {
             listener.await
         }
         Commands::Prune => {
-            if let Err(e) = pg.remove_setup().await {
+            if let Err(e) = postgres().remove_setup().await {
                 eprintln!("pruning failed: {}", e.to_string());
             }
             println!("all the tables, triggers related to boomerang have been removed.")
         }
     }
+}
+
+pub(crate) fn postgres() -> &'static PostgresDatabase {
+    POSTGRES.get().expect("postgres instance not initialized")
 }

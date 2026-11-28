@@ -675,12 +675,14 @@ dependencies = [
  "criterion",
  "futures",
  "hashbrown 0.17.1",
+ "http",
  "parking_lot 0.13.0",
  "rust_decimal",
  "rustc-hash",
  "serde_json",
  "sqlx",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 

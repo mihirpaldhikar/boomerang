@@ -39,7 +39,7 @@ use builder::HttpServerBuilder;
 use bytes::Bytes;
 pub use call::HttpCall;
 pub(crate) use connection::{Connection, WorkerScratch};
-pub use per_core::PerCore;
+pub use per_core::{CachePadded, PerCore, worker_id};
 use request_info::RequestInfo;
 use std::cell::Cell;
 use std::net::{SocketAddr, TcpListener};

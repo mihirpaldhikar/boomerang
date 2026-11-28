@@ -41,7 +41,9 @@ pub use protocol::{
 pub use router::{
     __register_route, MiddlewareHandler, RouteDefinition, RouteEntry, RouteHandler, SmallFuture,
 };
-pub use server::{HttpCall, HttpServer, HttpServerError, RestartContext, PerCore};
+pub use server::{
+    CachePadded, HttpCall, HttpServer, HttpServerError, PerCore, RestartContext, worker_id,
+};
 pub use tls::{AcmeChallengeMode, TlsConfig};
 
 #[doc(hidden)]
