@@ -23,17 +23,18 @@ mod active_set;
 mod builder;
 mod call;
 mod connection;
+mod encode;
 mod per_core;
 mod request_info;
 mod transport;
 
 use crate::cors::Cors;
-use crate::protocol::{
-    HttpMethod, HttpRequestError, HttpResponse, HttpStatus, TrustedProxies, Uninit,
-};
+use crate::protocol::{HttpRequestError, HttpResponse, Uninit};
 use crate::router::Router;
+use crate::server::connection::Limits;
 use crate::server::per_core::set_current_worker_id;
 use crate::tls::{AcmeChallengeStore, TlsBackgroundTask, TlsConfigError};
+use crate::{HttpMethod, HttpStatus, TrustedProxies};
 use active_set::ActiveSet;
 use builder::HttpServerBuilder;
 use bytes::Bytes;
@@ -42,7 +43,7 @@ pub(crate) use connection::{Connection, WorkerScratch};
 pub use per_core::{CachePadded, PerCore, worker_id};
 use request_info::RequestInfo;
 use std::cell::Cell;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -52,10 +53,13 @@ use tokio_rustls::TlsAcceptor;
 use transport::Transport;
 
 const ACCEPT_BATCH: usize = 32;
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const ACME_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 thread_local! {
     static WORKER_DRAIN_STATE: (Cell<usize>, Rc<Notify>) =
         (Cell::new(0), Rc::new(Notify::new()));
+    static DRAINING: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -93,6 +97,85 @@ impl RestartHandle {
             force,
             pre_hook: Box::new(move |ctx| Box::pin(pre_hook(ctx))),
         });
+    }
+}
+
+async fn verify_replacement(
+    mut child: std::process::Child,
+    request: RestartRequest,
+    window: std::time::Duration,
+    result_tx: tokio::sync::mpsc::UnboundedSender<Result<RestartRequest, ()>>,
+) {
+    tokio::time::sleep(window).await;
+
+    let result = match child.try_wait() {
+        Ok(None) => {
+            println!("New instance appears stable.");
+            Ok(request)
+        }
+        Ok(Some(status)) => {
+            println!("New instance exited with status: {status}");
+            Err(())
+        }
+        Err(e) => {
+            println!("Failed to check new instance status: {e}. Aborting.");
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(())
+        }
+    };
+    let _ = result_tx.send(result);
+}
+
+fn kill_child(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .spawn();
+    }
+}
+
+struct ShutdownSignals {
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                sigint: signal(SignalKind::interrupt()).expect("failed to listen for SIGINT"),
+                sigterm: signal(SignalKind::terminate()).expect("failed to listen for SIGTERM"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {}
+        }
+    }
+
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigint.recv() => "SIGINT",
+                _ = self.sigterm.recv() => "SIGTERM",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "SIGINT"
+        }
     }
 }
 
@@ -157,6 +240,28 @@ impl Drop for LocalTaskGuard {
     }
 }
 
+fn spawn_connection(
+    stream: tokio::net::TcpStream,
+    peer_addr: SocketAddr,
+    state: Rc<WorkerLocalState>,
+) {
+    let guard = LocalTaskGuard::new();
+    tokio::task::spawn_local(async move {
+        let _guard = guard;
+        let transport = match &state.server.tls {
+            None => Transport::from_tcp(stream, peer_addr),
+            Some(acceptor) => {
+                let handshake = acceptor.accept(stream);
+                match tokio::time::timeout(state.server.request_timeout, handshake).await {
+                    Ok(Ok(tls_stream)) => Transport::from_tls(tls_stream, peer_addr),
+                    _ => return,
+                }
+            }
+        };
+        HttpServer::handle_connection(transport, state).await;
+    });
+}
+
 thread_local! {
     static WORKER_REQ_ID: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
@@ -171,7 +276,7 @@ impl RequestId {
     }
 
     #[inline]
-    pub fn encode<'a>(self, buf: &'a mut [u8; 33]) -> &'a str {
+    pub fn encode(self, buf: &mut [u8; 33]) -> &str {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
         let prefix = (self.0 >> 64) as u64;
@@ -184,6 +289,7 @@ impl RequestId {
         let seq = self.0 as u64;
         if seq == 0 {
             buf[17] = b'0';
+            // SAFETY: only ASCII bytes were written.
             return unsafe { std::str::from_utf8_unchecked(&buf[..18]) };
         }
 
@@ -196,6 +302,7 @@ impl RequestId {
         }
         let seq_len = 33 - pos;
         buf.copy_within(pos..33, 17);
+        // SAFETY: only ASCII bytes were written.
         unsafe { std::str::from_utf8_unchecked(&buf[..17 + seq_len]) }
     }
 }
@@ -376,6 +483,27 @@ pub type ActiveRequest = ActiveSet<RequestId, RequestInfo>;
 type OnRequestComplete =
     Arc<dyn Fn(RequestInfo) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+thread_local! {
+    static DRAIN_NOTIFY: Rc<Notify> = Rc::new(Notify::new());
+}
+
+pub(crate) fn is_draining() -> bool {
+    DRAINING.get()
+}
+
+fn start_draining() {
+    DRAINING.set(true);
+    DRAIN_NOTIFY.with(|n| n.notify_waiters());
+}
+
+pub(crate) async fn draining() {
+    let notify = DRAIN_NOTIFY.with(Rc::clone);
+    let notified = notify.notified();
+    if !is_draining() {
+        notified.await;
+    }
+}
+
 pub struct HttpServer {
     router: Router,
     listeners: Vec<TcpListener>,
@@ -419,132 +547,36 @@ impl HttpServer {
         };
 
         let fut = async move {
-            let mut restart_in_progress = false;
-
-            let child_pid: Arc<std::sync::Mutex<Option<u32>>> =
-                Arc::new(std::sync::Mutex::new(None));
-
-            let connection_handle = RestartHandle {
-                restart_tx: restart_tx.clone(),
-            };
-
-            #[cfg(unix)]
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-
+            let mut child_pid: Option<u32> = None;
+            let mut signals = ShutdownSignals::new();
             let (stop_accept_tx, stop_accept_rx) = tokio::sync::watch::channel(false);
 
             let drain_barrier = Self::spawn_workers(
                 listeners,
                 worker_count,
                 server.clone(),
-                connection_handle,
+                RestartHandle { restart_tx },
                 stop_accept_rx.clone(),
             );
 
-            let acme_http_handle = acme_http_listener.map(|std_http| {
-                let srv = server.clone();
-                let mut stop_rx = stop_accept_rx.clone();
-                tokio::spawn(async move {
-                    std_http.set_nonblocking(true).unwrap();
-                    let Ok(listener) = tokio::net::TcpListener::from_std(std_http) else {
-                        return;
-                    };
-                    loop {
-                        tokio::select! {
-                            biased;
-                            res = stop_rx.changed() => {
-                                if res.is_err() || *stop_rx.borrow() {
-                                    break;
-                                }
-                            }
-                            accepted = listener.accept() => {
-                                if let Ok((stream, _)) = accepted {
-                                    let _ = stream.set_nodelay(true);
-                                    let s = srv.clone();
-                                    tokio::spawn(async move {
-                                        s.handle_acme_http_conn(stream).await;
-                                    });
-                                }
-                            }
-                        }
-                    }
-                })
+            let acme_http_handle = acme_http_listener.map(|listener| {
+                Self::spawn_acme_http(server.clone(), listener, stop_accept_rx.clone())
             });
-
-            let tls_bg_handle = tls_background.map(|bg| {
-                tokio::spawn(async move {
-                    match bg {
-                        TlsBackgroundTask::AutoReload {
-                            cert_path,
-                            key_path,
-                            interval,
-                            resolver,
-                        } => loop {
-                            tokio::time::sleep(interval).await;
-                            if let Ok((certs, key)) =
-                                crate::tls::load_from_files(&cert_path, &key_path)
-                            {
-                                if let Ok(ck) = crate::tls::build_certified_key(certs, key) {
-                                    resolver.update(Arc::new(ck));
-                                }
-                            }
-                        },
-                        TlsBackgroundTask::Acme {
-                            config,
-                            resolver,
-                            http_challenges,
-                        } => {
-                            crate::tls::run_acme_loop(config, resolver, http_challenges).await;
-                        }
-                    }
-                })
-            });
+            let tls_bg_handle = tls_background.map(Self::spawn_tls_background);
 
             let force: bool = loop {
                 tokio::select! {
-                    Some(restart_req) = restart_rx.recv() => {
-                        if restart_in_progress {
+                    Some(request) = restart_rx.recv() => {
+                        if child_pid.is_some() {
                             println!("Restart already in progress, ignoring duplicate.");
                             continue;
                         }
 
-                        restart_in_progress = true;
-                        println!("Restart triggered. Force: {}", restart_req.force);
-
-                        let exe_path = match &server.exe_path {
-                            Some(p) if p.is_absolute() && p.exists() => p.clone(),
-                            _ => match std::env::current_exe() {
-                                Ok(p) if p.is_absolute() && p.exists() => p,
-                                Ok(p) => {
-                                    println!(
-                                        "Restart aborted: executable path '{}' is unavailable.",
-                                        p.display()
-                                    );
-                                    restart_in_progress = false;
-                                    continue;
-                                }
-                                Err(e) => {
-                                    println!("Failed to get executable path: {}", e);
-                                    restart_in_progress = false;
-                                    continue;
-                                }
-                            },
+                        println!("Restart triggered. Force: {}", request.force);
+                        let Some(child) = server.spawn_replacement() else {
+                            continue;
                         };
-
-                        let mut child = match std::process::Command::new(&exe_path)
-                            .args(std::env::args().skip(1))
-                            .spawn()
-                        {
-                            Ok(c) => c,
-                            Err(e) => {
-                                println!("Failed to spawn new process: {}", e);
-                                restart_in_progress = false;
-                                continue;
-                            }
-                        };
-
-                        *child_pid.lock().unwrap() = Some(child.id());
+                        child_pid = Some(child.id());
 
                         println!(
                             "New process spawned (PID {}). Verifying stability for {}s...",
@@ -552,135 +584,59 @@ impl HttpServer {
                             server.restart_stability_window.as_secs(),
                         );
 
-                        let result_tx = result_tx.clone();
-                        let stability_window = server.restart_stability_window;
-
-                        tokio::spawn(async move {
-                            tokio::time::sleep(stability_window).await;
-
-                            match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    println!(
-                                        "New instance crashed with status: {}",
-                                        status
-                                    );
-                                    let _ = result_tx.send(Err(()));
-                                }
-                                Ok(None) => {
-                                    println!("New instance appears stable.");
-                                    let _ = result_tx.send(Ok(restart_req));
-                                }
-                                Err(e) => {
-                                    println!(
-                                        "Failed to check new instance status: {}. Aborting.",
-                                        e
-                                    );
-                                    let _ = result_tx.send(Err(()));
-                                }
-                            }
-                        });
+                        tokio::spawn(verify_replacement(
+                            child,
+                            request,
+                            server.restart_stability_window,
+                            result_tx.clone(),
+                        ));
                     }
 
-                    result = result_rx.recv() => {
-                        match result {
-                            Some(Ok(restart_req)) => {
-                                println!(
-                                    "New instance stable. Stopping accept loops..."
-                                );
+                    Some(result) = result_rx.recv() => {
+                        let Ok(request) = result else {
+                            println!("Restart failed. Unlocking for future attempts.");
+                            child_pid = None;
+                            continue;
+                        };
 
-                                let _ = stop_accept_tx.send(true);
-
-                                let ctx = RestartContext {
-                                    active_requests: server.active_requests
-                                        .snapshot()
-                                        .into_values()
-                                        .collect(),
-                                };
-
-                                println!(
-                                    "Running pre-hook with {} active requests...",
-                                    ctx.active_requests.len()
-                                );
-
-                                match tokio::time::timeout(
-                                    server.restart_pre_hook_timeout,
-                                    (restart_req.pre_hook)(ctx),
-                                ).await {
-                                    Ok(_) => {
-                                        println!("Pre-hook complete. Handing over.");
-                                    }
-                                    Err(_) => {
-                                        println!(
-                                            "Pre-hook timed out after {}s. Proceeding.",
-                                            server.restart_pre_hook_timeout.as_secs()
-                                        );
-                                    }
-                                }
-
-                                break restart_req.force;
-                            }
-                            Some(Err(_)) => {
-                                println!(
-                                    "Restart failed. Unlocking for future attempts."
-                                );
-                                *child_pid.lock().unwrap() = None;
-                                restart_in_progress = false;
-                            }
-                            None => {
-                                println!(
-                                    "Result channel closed unexpectedly. Unlocking."
-                                );
-                                *child_pid.lock().unwrap() = None;
-                                restart_in_progress = false;
-                            }
-                        }
-                    }
-
-                    _ = tokio::signal::ctrl_c() => {
-                        if restart_in_progress {
-                            if let Some(pid) = *child_pid.lock().unwrap() {
-                                println!(
-                                    "SIGINT during restart. Killing child PID {}.",
-                                    pid
-                                );
-                                #[cfg(unix)]
-                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                                #[cfg(not(unix))]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .spawn();
-                                }
-                            }
-                        }
-                        println!("SIGINT received. Graceful shutdown.");
+                        println!("New instance stable. Stopping accept loops...");
                         let _ = stop_accept_tx.send(true);
-                        break false;
+
+                        let ctx = RestartContext {
+                            active_requests: server
+                                .active_requests
+                                .snapshot()
+                                .into_values()
+                                .collect(),
+                        };
+
+                        println!(
+                            "Running pre-hook with {} active requests...",
+                            ctx.active_requests.len()
+                        );
+
+                        match tokio::time::timeout(
+                            server.restart_pre_hook_timeout,
+                            (request.pre_hook)(ctx),
+                        )
+                        .await
+                        {
+                            Ok(_) => println!("Pre-hook complete. Handing over."),
+                            Err(_) => println!(
+                                "Pre-hook timed out after {}s. Proceeding.",
+                                server.restart_pre_hook_timeout.as_secs()
+                            ),
+                        }
+
+                        break request.force;
                     }
 
-                    _ = async {
-                        #[cfg(unix)]
-                        sigterm.recv().await;
-                        #[cfg(not(unix))]
-                        std::future::pending::<()>().await;
-                    } => {
-                        if restart_in_progress {
-                            if let Some(pid) = *child_pid.lock().unwrap() {
-                                println!(
-                                    "SIGTERM during restart. Killing child PID {}.",
-                                    pid
-                                );
-                                #[cfg(unix)]
-                                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL); }
-                                #[cfg(not(unix))]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/F"])
-                                        .spawn();
-                                }
-                            }
+                    name = signals.recv() => {
+                        if let Some(pid) = child_pid {
+                            println!("{name} during restart. Killing child PID {pid}.");
+                            kill_child(pid);
                         }
-                        println!("SIGTERM received. Graceful shutdown.");
+                        println!("{name} received. Graceful shutdown.");
                         let _ = stop_accept_tx.send(true);
                         break false;
                     }
@@ -697,18 +653,218 @@ impl HttpServer {
             if force {
                 println!("Force shutdown. Exiting immediately.");
                 std::process::exit(0);
-            } else {
-                println!("Graceful shutdown. Waiting for active requests...");
+            }
+
+            println!("Waiting for active requests. Signal again to force exit.");
+            let drain = async {
                 server.active_requests.wait_for_zero().await;
-                println!("All requests complete. Waiting for threads to drain...");
                 drain_barrier.wait_all_done().await;
-                println!("All threads drained. Exiting.");
+            };
+            tokio::select! {
+                _ = drain => println!("All threads drained. Exiting."),
+                _ = signals.recv() => {
+                    println!("Second signal received. Exiting.");
+                    std::process::exit(130);
+                }
+                _ = tokio::time::sleep(DRAIN_TIMEOUT) => {
+                    println!("Drain timed out. Exiting.");
+                    std::process::exit(1);
+                }
             }
         };
 
         (handle, fut)
     }
 
+    fn spawn_replacement(&self) -> Option<std::process::Child> {
+        let exe_path = match &self.exe_path {
+            Some(p) if p.is_absolute() && p.exists() => p.clone(),
+            _ => match std::env::current_exe() {
+                Ok(p) if p.is_absolute() && p.exists() => p,
+                Ok(p) => {
+                    println!(
+                        "Restart aborted: executable path '{}' is unavailable.",
+                        p.display()
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    println!("Failed to get executable path: {e}");
+                    return None;
+                }
+            },
+        };
+
+        std::process::Command::new(&exe_path)
+            .args(std::env::args_os().skip(1))
+            .spawn()
+            .inspect_err(|e| println!("Failed to spawn new process: {e}"))
+            .ok()
+    }
+
+    fn spawn_acme_http(
+        server: Arc<Self>,
+        std_listener: TcpListener,
+        mut stop_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if std_listener.set_nonblocking(true).is_err() {
+                return;
+            }
+            let Ok(listener) = tokio::net::TcpListener::from_std(std_listener) else {
+                return;
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    res = stop_rx.changed() => {
+                        if res.is_err() || *stop_rx.borrow() {
+                            break;
+                        }
+                    }
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            let _ = stream.set_nodelay(true);
+                            let server = server.clone();
+                            tokio::spawn(async move {
+                                let conn = server.handle_acme_http_conn(stream);
+                                let _ = tokio::time::timeout(ACME_CONN_TIMEOUT, conn).await;
+                            });
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    fn spawn_tls_background(task: TlsBackgroundTask) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            match task {
+                TlsBackgroundTask::AutoReload {
+                    cert_path,
+                    key_path,
+                    interval,
+                    resolver,
+                } => loop {
+                    tokio::time::sleep(interval).await;
+                    if let Ok((certs, key)) = crate::tls::load_from_files(&cert_path, &key_path)
+                        && let Ok(ck) = crate::tls::build_certified_key(certs, key)
+                    {
+                        resolver.update(Arc::new(ck));
+                    }
+                },
+                TlsBackgroundTask::Acme {
+                    config,
+                    resolver,
+                    http_challenges,
+                } => {
+                    crate::tls::run_acme_loop(config, resolver, http_challenges).await;
+                }
+            }
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_workers(
+        listeners: Vec<TcpListener>,
+        _worker_count: usize,
+        server: Arc<Self>,
+        connection_handle: RestartHandle,
+        stop_accept_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> ThreadDrainBarrier {
+        let allowed_cpus = allowed_linux_cpus();
+        let drain_barrier = ThreadDrainBarrier::new(listeners.len());
+
+        for (idx, std_listener) in listeners.into_iter().enumerate() {
+            let server_clone = server.clone();
+            let restart_handle = connection_handle.clone();
+            let mut stop_rx = stop_accept_rx.clone();
+            let barrier = drain_barrier.clone();
+            let cpu_id = if allowed_cpus.is_empty() {
+                Some(idx)
+            } else {
+                Some(allowed_cpus[idx % allowed_cpus.len()])
+            };
+
+            std::thread::Builder::new()
+                .name(format!("http-worker-{idx}"))
+                .spawn(move || {
+                    pin_current_thread_to_cpu(cpu_id);
+                    init_worker_request_id_gen(idx);
+                    set_current_worker_id(idx);
+
+                    let local_state = Rc::new(WorkerLocalState::new(server_clone, restart_handle));
+
+                    let rt = build_worker_local_runtime();
+                    rt.block_on(async move {
+                        std_listener.set_nonblocking(true).unwrap();
+                        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+
+                        loop {
+                            if *stop_rx.borrow() {
+                                break;
+                            }
+
+                            let outcome = tokio::select! {
+                                biased;
+                                res = stop_rx.changed() => {
+                                    if res.is_err() || *stop_rx.borrow() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                res = std::future::poll_fn(|cx| {
+                                    let mut accepted = 0usize;
+                                    while accepted < ACCEPT_BATCH {
+                                        match listener.poll_accept(cx) {
+                                            Poll::Ready(Ok((stream, peer_addr))) => {
+                                                let _ = stream.set_nodelay(true);
+                                                spawn_connection(
+                                                    stream,
+                                                    peer_addr,
+                                                    local_state.clone(),
+                                                );
+                                                accepted += 1;
+                                            }
+                                            Poll::Ready(Err(e)) => {
+                                                if is_transient_accept_error(&e) {
+                                                    continue;
+                                                }
+                                                return Poll::Ready(Err(e));
+                                            }
+                                            Poll::Pending => return Poll::Pending,
+                                        }
+                                    }
+                                    Poll::Ready(Ok(()))
+                                }) => res,
+                            };
+
+                            match outcome {
+                                // A full batch: let connection tasks run.
+                                Ok(()) => tokio::task::yield_now().await,
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
+
+                        drop(listener);
+                        start_draining();
+                        LocalTaskGuard::wait_for_zero().await;
+                    });
+
+                    barrier.thread_done();
+                })
+                .expect("failed to spawn http-worker thread");
+        }
+
+        drain_barrier
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn spawn_workers(
         listeners: Vec<TcpListener>,
         worker_count: usize,
@@ -716,90 +872,169 @@ impl HttpServer {
         connection_handle: RestartHandle,
         stop_accept_rx: tokio::sync::watch::Receiver<bool>,
     ) -> ThreadDrainBarrier {
-        #[cfg(target_os = "linux")]
-        let allowed_cpus = allowed_linux_cpus();
-        #[cfg(not(target_os = "linux"))]
-        let allowed_cpus: Vec<usize> = Vec::new();
+        let total_threads = worker_count + listeners.len();
+        let drain_barrier = ThreadDrainBarrier::new(total_threads);
 
-        #[cfg(target_os = "linux")]
-        {
-            let drain_barrier = ThreadDrainBarrier::new(listeners.len());
+        let mut worker_txs = Vec::with_capacity(worker_count);
+        for idx in 0..worker_count {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<(TcpStream, SocketAddr)>(1024);
+            worker_txs.push(tx);
 
-            for (idx, std_listener) in listeners.into_iter().enumerate() {
-                let server_clone = server.clone();
-                let restart_handle = connection_handle.clone();
-                let mut stop_rx = stop_accept_rx.clone();
-                let barrier = drain_barrier.clone();
-                let cpu_id = if allowed_cpus.is_empty() {
-                    Some(idx)
-                } else {
-                    Some(allowed_cpus[idx % allowed_cpus.len()])
-                };
+            let server_clone = server.clone();
+            let restart_handle = connection_handle.clone();
+            let mut stop_rx = stop_accept_rx.clone();
+            let barrier = drain_barrier.clone();
 
-                std::thread::Builder::new()
-                    .name(format!("http-worker-{idx}"))
-                    .spawn(move || {
-                        pin_current_thread_to_cpu(cpu_id);
-                        init_worker_request_id_gen(idx);
-                        set_current_worker_id(idx);
+            std::thread::Builder::new()
+                .name(format!("http-worker-{idx}"))
+                .spawn(move || {
+                    pin_current_thread_to_cpu(None);
+                    init_worker_request_id_gen(idx);
+                    set_current_worker_id(idx);
 
-                        let local_state =
-                            std::rc::Rc::new(WorkerLocalState::new(server_clone, restart_handle));
+                    let local_state = Rc::new(WorkerLocalState::new(server_clone, restart_handle));
 
-                        let rt = build_worker_local_runtime();
-                        rt.block_on(async move {
-                            std_listener.set_nonblocking(true).unwrap();
-                            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-
-                            loop {
-                                if *stop_rx.borrow() {
-                                    break;
-                                }
-
-                                let outcome = tokio::select! {
-                                    biased;
-                                    res = stop_rx.changed() => {
-                                        if res.is_err() || *stop_rx.borrow() {
-                                            break;
-                                        }
-                                        continue;
+                    let rt = build_worker_local_runtime();
+                    rt.block_on(async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                res = stop_rx.changed() => {
+                                    if res.is_err() || *stop_rx.borrow() {
+                                        break;
                                     }
-                                    res = std::future::poll_fn(|cx| {
-                                        let mut accepted = 0usize;
-                                        while accepted < ACCEPT_BATCH {
+                                }
+                                msg = rx.recv() => {
+                                    let Some((std_stream, peer_addr)) = msg else {
+                                        break;
+                                    };
+                                    if let Ok(stream) =
+                                        tokio::net::TcpStream::from_std(std_stream)
+                                    {
+                                        spawn_connection(stream, peer_addr, local_state.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        start_draining();
+                        rx.close();
+                        while let Some((std_stream, peer_addr)) = rx.recv().await {
+                            if let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) {
+                                spawn_connection(stream, peer_addr, local_state.clone());
+                            }
+                        }
+
+                        LocalTaskGuard::wait_for_zero().await;
+                    });
+
+                    barrier.thread_done();
+                })
+                .expect("failed to spawn http-worker thread");
+        }
+
+        for (idx, std_listener) in listeners.into_iter().enumerate() {
+            let txs = worker_txs.clone();
+            let mut stop_rx = stop_accept_rx.clone();
+            let barrier = drain_barrier.clone();
+
+            std::thread::Builder::new()
+                .name(format!("http-acceptor-{idx}"))
+                .spawn(move || {
+                    pin_current_thread_to_cpu(None);
+
+                    let rt = build_worker_local_runtime();
+                    rt.block_on(async move {
+                        std_listener.set_nonblocking(true).unwrap();
+
+                        #[cfg(unix)]
+                        let async_fd = unsafe {
+                            // SAFETY: `std_listener` is an owned, valid `std::net::TcpListener`
+                            // whose FD stays open and unchanged until `async_fd` is dropped.
+                            tokio::io::unix::AsyncFd::register_with_interest(
+                                std_listener,
+                                tokio::io::Interest::READABLE,
+                            )
+                        }
+                        .expect("failed to register listener with AsyncFd");
+
+                        #[cfg(not(unix))]
+                        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+
+                        let mut batch: Vec<(TcpStream, SocketAddr)> =
+                            Vec::with_capacity(ACCEPT_BATCH);
+                        let mut next_worker = 0usize;
+
+                        loop {
+                            if *stop_rx.borrow() {
+                                break;
+                            }
+
+                            batch.clear();
+                            let outcome = tokio::select! {
+                                biased;
+                                res = stop_rx.changed() => {
+                                    if res.is_err() || *stop_rx.borrow() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                res = std::future::poll_fn(|cx| {
+                                    #[cfg(unix)]
+                                    {
+                                        loop {
+                                            let mut guard = match async_fd.poll_read_ready(cx) {
+                                                Poll::Ready(Ok(g)) => g,
+                                                Poll::Ready(Err(e)) => {
+                                                    return Poll::Ready(Err(e));
+                                                }
+                                                Poll::Pending => {
+                                                    if batch.is_empty() {
+                                                        return Poll::Pending;
+                                                    }
+                                                    return Poll::Ready(Ok(false));
+                                                }
+                                            };
+
+                                            while batch.len() < ACCEPT_BATCH {
+                                                match guard
+                                                    .try_io(|inner| inner.get_ref().accept())
+                                                {
+                                                    Ok(Ok((std_stream, peer_addr))) => {
+                                                        let _ = std_stream.set_nonblocking(true);
+                                                        let _ = std_stream.set_nodelay(true);
+                                                        batch.push((std_stream, peer_addr));
+                                                    }
+                                                    Ok(Err(e)) => {
+                                                        if is_transient_accept_error(&e) {
+                                                            continue;
+                                                        }
+                                                        return Poll::Ready(Err(e));
+                                                    }
+                                                    Err(_would_block) => {
+                                                        if !batch.is_empty() {
+                                                            return Poll::Ready(Ok(false));
+                                                        }
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            if batch.len() >= ACCEPT_BATCH {
+                                                return Poll::Ready(Ok(true));
+                                            }
+                                        }
+                                    }
+
+                                    #[cfg(not(unix))]
+                                    {
+                                        while batch.len() < ACCEPT_BATCH {
                                             match listener.poll_accept(cx) {
                                                 Poll::Ready(Ok((stream, peer_addr))) => {
                                                     let _ = stream.set_nodelay(true);
-
-                                                    let state = local_state.clone();
-
-                                                    tokio::task::spawn_local(async move {
-                                                        let _guard = LocalTaskGuard::new();
-
-                                                        let transport = match &state.server.tls {
-                                                            None => Transport::from_tcp(
-                                                                stream, peer_addr,
-                                                            ),
-                                                            Some(acceptor) => {
-                                                                match acceptor.accept(stream).await
-                                                                {
-                                                                    Ok(tls_stream) => {
-                                                                        Transport::from_tls(
-                                                                            tls_stream, peer_addr,
-                                                                        )
-                                                                    }
-                                                                    Err(_) => return,
-                                                                }
-                                                            }
-                                                        };
-
-                                                        HttpServer::handle_connection(
-                                                            transport, state,
-                                                        )
-                                                        .await;
-                                                    });
-
-                                                    accepted += 1;
+                                                    if let Ok(std_stream) = stream.into_std() {
+                                                        batch.push((std_stream, peer_addr));
+                                                    }
                                                 }
                                                 Poll::Ready(Err(e)) => {
                                                     if is_transient_accept_error(&e) {
@@ -808,316 +1043,74 @@ impl HttpServer {
                                                     return Poll::Ready(Err(e));
                                                 }
                                                 Poll::Pending => {
-                                                    return Poll::Pending;
+                                                    if batch.is_empty() {
+                                                        return Poll::Pending;
+                                                    }
+                                                    return Poll::Ready(Ok(false));
                                                 }
                                             }
                                         }
                                         Poll::Ready(Ok(true))
-                                    }) => res,
-                                };
-
-                                match outcome {
-                                    Ok(true) => tokio::task::yield_now().await,
-                                    Ok(false) => {}
-                                    Err(_) => {
-                                        tokio::time::sleep(std::time::Duration::from_millis(5))
-                                            .await;
                                     }
+                                }) => res,
+                            };
+
+                            for conn in batch.drain(..) {
+                                let mut pending = Some(conn);
+                                for offset in 0..txs.len() {
+                                    let target = (next_worker + offset) % txs.len();
+                                    if let Some(item) = pending.take() {
+                                        match txs[target].try_send(item) {
+                                            Ok(()) => {
+                                                next_worker = (target + 1) % txs.len();
+                                                break;
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                                returned,
+                                            )) => {
+                                                pending = Some(returned);
+                                            }
+                                            Err(
+                                                tokio::sync::mpsc::error::TrySendError::Closed(
+                                                    returned,
+                                                ),
+                                            ) => {
+                                                pending = Some(returned);
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(item) = pending {
+                                    let target = next_worker;
+                                    next_worker = (next_worker + 1) % txs.len();
+                                    let _ = txs[target].send(item).await;
                                 }
                             }
 
-                            drop(listener);
-                            LocalTaskGuard::wait_for_zero().await;
-                        });
+                            match outcome {
+                                Ok(true) => tokio::task::yield_now().await,
+                                Ok(false) => {}
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
 
-                        barrier.thread_done();
-                    })
-                    .expect("failed to spawn http-worker thread");
-            }
+                        #[cfg(unix)]
+                        drop(async_fd);
+                        #[cfg(not(unix))]
+                        drop(listener);
+                    });
 
-            drain_barrier
+                    barrier.thread_done();
+                })
+                .expect("failed to spawn http-acceptor thread");
         }
 
-        // Non-Linux (macOS, Windows, BSD without SO_REUSEPORT_LB)
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = allowed_cpus;
-            let total_threads = worker_count + listeners.len();
-            let drain_barrier = ThreadDrainBarrier::new(total_threads);
-
-            let mut worker_txs = Vec::with_capacity(worker_count);
-            for idx in 0..worker_count {
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::channel::<(std::net::TcpStream, SocketAddr)>(1024);
-                worker_txs.push(tx);
-
-                let server_clone = server.clone();
-                let restart_handle = connection_handle.clone();
-                let mut stop_rx = stop_accept_rx.clone();
-                let barrier = drain_barrier.clone();
-
-                std::thread::Builder::new()
-                    .name(format!("http-worker-{idx}"))
-                    .spawn(move || {
-                        pin_current_thread_to_cpu(None);
-                        init_worker_request_id_gen(idx);
-                        set_current_worker_id(idx);
-
-                        let local_state =
-                            Rc::new(WorkerLocalState::new(server_clone, restart_handle));
-
-                        let rt = build_worker_local_runtime();
-                        rt.block_on(async move {
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    res = stop_rx.changed() => {
-                                        if res.is_err() || *stop_rx.borrow() {
-                                            break;
-                                        }
-                                    }
-                                    msg = rx.recv() => {
-                                        let Some((std_stream, peer_addr)) = msg else {
-                                            break;
-                                        };
-                                        let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) else {
-                                            continue;
-                                        };
-
-                                        let state = local_state.clone();
-
-                                        tokio::task::spawn_local(async move {
-                                            let _guard = LocalTaskGuard::new();
-
-                                            let transport = match &state.server.tls {
-                                                None => Transport::from_tcp(stream, peer_addr),
-                                                Some(acceptor) => match acceptor.accept(stream).await {
-                                                    Ok(tls_stream) => Transport::from_tls(tls_stream, peer_addr),
-                                                    Err(_) => return,
-                                                },
-                                            };
-
-                                            HttpServer::handle_connection(transport, state).await;
-                                        });
-                                    }
-                                }
-                            }
-
-                            // Drain any sockets already queued before shutdown
-                            rx.close();
-                            while let Some((std_stream, peer_addr)) = rx.recv().await {
-                                let Ok(stream) = tokio::net::TcpStream::from_std(std_stream) else {
-                                    continue;
-                                };
-
-                                let state = local_state.clone();
-
-                                tokio::task::spawn_local(async move {
-                                    let _guard = LocalTaskGuard::new();
-
-                                    let transport = match &state.server.tls {
-                                        None => Transport::from_tcp(stream, peer_addr),
-                                        Some(acceptor) => match acceptor.accept(stream).await {
-                                            Ok(tls_stream) => Transport::from_tls(tls_stream, peer_addr),
-                                            Err(_) => return,
-                                        },
-                                    };
-
-                                    HttpServer::handle_connection(transport, state).await;
-                                });
-                            }
-
-                            LocalTaskGuard::wait_for_zero().await;
-                        });
-
-                        barrier.thread_done();
-                    })
-                    .expect("failed to spawn http-worker thread");
-            }
-
-            for (idx, std_listener) in listeners.into_iter().enumerate() {
-                let txs = worker_txs.clone();
-                let mut stop_rx = stop_accept_rx.clone();
-                let barrier = drain_barrier.clone();
-
-                std::thread::Builder::new()
-                    .name(format!("http-acceptor-{idx}"))
-                    .spawn(move || {
-                        pin_current_thread_to_cpu(None);
-
-                        let rt = build_worker_local_runtime();
-                        rt.block_on(async move {
-                            std_listener.set_nonblocking(true).unwrap();
-
-                            #[cfg(unix)]
-                            let async_fd = unsafe {
-                                // SAFETY: `std_listener` is an owned, valid `std::net::TcpListener`
-                                // whose FD stays open and unchanged until `async_fd` is dropped.
-                                tokio::io::unix::AsyncFd::register_with_interest(
-                                    std_listener,
-                                    tokio::io::Interest::READABLE,
-                                )
-                            }
-                            .expect("failed to register listener with AsyncFd");
-
-                            #[cfg(not(unix))]
-                            let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
-
-                            let mut batch: Vec<(std::net::TcpStream, SocketAddr)> =
-                                Vec::with_capacity(ACCEPT_BATCH);
-                            let mut next_worker = 0usize;
-
-                            loop {
-                                if *stop_rx.borrow() {
-                                    break;
-                                }
-
-                                batch.clear();
-                                let outcome = tokio::select! {
-                                    biased;
-                                    res = stop_rx.changed() => {
-                                        if res.is_err() || *stop_rx.borrow() {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                    res = std::future::poll_fn(|cx| {
-                                        #[cfg(unix)]
-                                        {
-                                            loop {
-                                                let mut guard = match async_fd.poll_read_ready(cx) {
-                                                    Poll::Ready(Ok(g)) => g,
-                                                    Poll::Ready(Err(e)) => {
-                                                        return Poll::Ready(Err(e));
-                                                    }
-                                                    Poll::Pending => {
-                                                        if batch.is_empty() {
-                                                            return Poll::Pending;
-                                                        }
-                                                        return Poll::Ready(Ok(false));
-                                                    }
-                                                };
-
-                                                while batch.len() < ACCEPT_BATCH {
-                                                    match guard
-                                                        .try_io(|inner| inner.get_ref().accept())
-                                                    {
-                                                        Ok(Ok((std_stream, peer_addr))) => {
-                                                            let _ =
-                                                                std_stream.set_nonblocking(true);
-                                                            let _ = std_stream.set_nodelay(true);
-                                                            batch.push((std_stream, peer_addr));
-                                                        }
-                                                        Ok(Err(e)) => {
-                                                            if is_transient_accept_error(&e) {
-                                                                continue;
-                                                            }
-                                                            return Poll::Ready(Err(e));
-                                                        }
-                                                        Err(_would_block) => {
-                                                            if !batch.is_empty() {
-                                                                return Poll::Ready(Ok(false));
-                                                            }
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-
-                                                if batch.len() >= ACCEPT_BATCH {
-                                                    return Poll::Ready(Ok(true));
-                                                }
-                                            }
-                                        }
-
-                                        #[cfg(not(unix))]
-                                        {
-                                            while batch.len() < ACCEPT_BATCH {
-                                                match listener.poll_accept(cx) {
-                                                    Poll::Ready(Ok((stream, peer_addr))) => {
-                                                        let _ = stream.set_nodelay(true);
-                                                        if let Ok(std_stream) = stream.into_std() {
-                                                            batch.push((std_stream, peer_addr));
-                                                        }
-                                                    }
-                                                    Poll::Ready(Err(e)) => {
-                                                        if is_transient_accept_error(&e) {
-                                                            continue;
-                                                        }
-                                                        return Poll::Ready(Err(e));
-                                                    }
-                                                    Poll::Pending => {
-                                                        if batch.is_empty() {
-                                                            return Poll::Pending;
-                                                        }
-                                                        return Poll::Ready(Ok(false));
-                                                    }
-                                                }
-                                            }
-                                            Poll::Ready(Ok(true))
-                                        }
-                                    }) => res,
-                                };
-
-                                for conn in batch.drain(..) {
-                                    let mut pending = Some(conn);
-                                    for offset in 0..txs.len() {
-                                        let target = (next_worker + offset) % txs.len();
-                                        if let Some(item) = pending.take() {
-                                            match txs[target].try_send(item) {
-                                                Ok(()) => {
-                                                    next_worker = (target + 1) % txs.len();
-                                                    break;
-                                                }
-                                                Err(
-                                                    tokio::sync::mpsc::error::TrySendError::Full(
-                                                        returned,
-                                                    ),
-                                                ) => {
-                                                    pending = Some(returned);
-                                                }
-                                                Err(
-                                                    tokio::sync::mpsc::error::TrySendError::Closed(
-                                                        _,
-                                                    ),
-                                                ) => {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if let Some(item) = pending {
-                                        let target = next_worker;
-                                        next_worker = (next_worker + 1) % txs.len();
-                                        let _ = txs[target].send(item).await;
-                                    }
-                                }
-
-                                match outcome {
-                                    Ok(true) => tokio::task::yield_now().await,
-                                    Ok(false) => {}
-                                    Err(_) => {
-                                        tokio::time::sleep(std::time::Duration::from_millis(5))
-                                            .await;
-                                    }
-                                }
-                            }
-
-                            #[cfg(unix)]
-                            drop(async_fd);
-                            #[cfg(not(unix))]
-                            drop(listener);
-                        });
-
-                        barrier.thread_done();
-                    })
-                    .expect("failed to spawn http-acceptor thread");
-            }
-
-            drain_barrier
-        }
+        drain_barrier
     }
 
-    async fn handle_connection(transport: Transport, state: std::rc::Rc<WorkerLocalState>) {
+    async fn handle_connection(transport: Transport, state: Rc<WorkerLocalState>) {
         let srv_state = state.clone();
         let idle_sleep = tokio::time::sleep(srv_state.server.keep_alive_timeout);
         tokio::pin!(idle_sleep);
@@ -1154,18 +1147,18 @@ impl HttpServer {
         let mut call: HttpCall = match HttpCall::parse(
             connection,
             request_id,
-            self.max_body_size,
-            self.keep_alive_timeout,
-            self.request_timeout,
+            &Limits {
+                request_timeout: self.request_timeout,
+                max_body_size: self.max_body_size,
+                keep_alive: self.keep_alive_timeout,
+            },
             idle_sleep,
             last_timer_sec,
         )
         .await
         {
             Ok(Some(call)) => call,
-            Ok(None) => {
-                return None;
-            }
+            Ok(None) => return None,
             Err((mut stream, err)) => {
                 let status = match err {
                     HttpRequestError::PayloadTooLarge => HttpStatus::ContentTooLarge,
@@ -1190,18 +1183,21 @@ impl HttpServer {
             }
         };
 
-        let keep_alive = call
-            .header("connection")
-            .map(|v| !v.eq_ignore_ascii_case("close"))
-            .unwrap_or(true);
+        let is_http11 = call.request.http_version()[..] == b"HTTP/1.1"[..];
+        let has_token = |token: &str| {
+            call.header("connection")
+                .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
+        };
+        let keep_alive =
+            !DRAINING.get() && !has_token("close") && (is_http11 || has_token("keep-alive"));
 
         call.connection.get_mut().set_keep_alive(keep_alive);
 
-        if let Some(cors) = &self.cors {
-            if *call.method() == HttpMethod::OPTIONS {
-                cors.handle_preflight(&mut call).await;
-                return self.finish(call, keep_alive).await;
-            }
+        if let Some(cors) = &self.cors
+            && *call.method() == HttpMethod::OPTIONS
+        {
+            cors.handle_preflight(&mut call).await;
+            return self.finish(call, keep_alive).await;
         }
 
         let _active_guard = if let Some(on_complete) = &self.on_request_complete {
@@ -1216,17 +1212,13 @@ impl HttpServer {
 
             let g = guard.clone();
             let on_complete = on_complete.clone();
-            call.set_response_hook(Arc::new(move |status_code| {
-                g.update(|info| {
-                    info.set_response_status(status_code.clone());
-                    info.mark_as_end();
-                });
-                if let Some(mut info) = g.value() {
-                    info.set_response_status(status_code);
+            call.set_response_hook(Arc::new(move |status_code, delivered| {
+                g.update(|info| info.complete(status_code, delivered));
+                if let Some(info) = g.value() {
                     let fut = on_complete(info);
-                    let hg = LocalTaskGuard::new();
+                    let hook_guard = LocalTaskGuard::new();
                     tokio::task::spawn_local(async move {
-                        let _hg = hg;
+                        let _hook_guard = hook_guard;
                         fut.await;
                     });
                 }
@@ -1321,6 +1313,7 @@ impl HttpServer {
 
         (matched.handler)(&mut call).await;
 
+        let keep_alive = keep_alive && call.response_sent();
         self.finish(call, keep_alive).await
     }
 
@@ -1339,6 +1332,8 @@ impl HttpServer {
         if keep_alive && call.discard_unread_body().await.is_err() {
             keep_alive = false;
         }
+
+        keep_alive &= call.connection.borrow().keep_alive();
 
         if keep_alive {
             WorkerScratch::recycle_request(

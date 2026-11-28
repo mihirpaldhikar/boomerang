@@ -29,6 +29,7 @@ pub struct RequestInfo {
     route: Arc<str>,
     method: HttpMethod,
     response_status: Option<HttpStatus>,
+    delivered: bool,
     started_at: std::time::SystemTime,
     ended_at: Option<std::time::SystemTime>,
 }
@@ -40,6 +41,7 @@ impl RequestInfo {
             route,
             method,
             response_status: None,
+            delivered: false,
             started_at: std::time::SystemTime::now(),
             ended_at: None,
         }
@@ -62,6 +64,16 @@ impl RequestInfo {
     }
     pub fn ended_at(&self) -> Option<std::time::SystemTime> {
         self.ended_at
+    }
+
+    pub fn delivered(&self) -> bool {
+        self.delivered
+    }
+
+    pub(crate) fn complete(&mut self, status: HttpStatus, delivered: bool) {
+        self.response_status = Some(status);
+        self.delivered = delivered;
+        self.ended_at = Some(std::time::SystemTime::now());
     }
 
     pub(crate) fn set_response_status(&mut self, status: HttpStatus) {

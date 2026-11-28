@@ -73,27 +73,10 @@ impl Transport {
     }
 
     #[inline]
-    pub fn is_plain_tcp(&self) -> bool {
-        matches!(self.stream, StreamInner::Tcp(_))
-    }
-
-    #[inline]
-    pub async fn wait_readable(&self) -> std::io::Result<()> {
+    pub fn as_tcp(&self) -> Option<&TcpStream> {
         match &self.stream {
-            StreamInner::Tcp(s) => s.readable().await,
-            StreamInner::Tls(s) => s.get_ref().0.readable().await,
-            StreamInner::Custom(_) => Ok(()),
-        }
-    }
-
-    #[inline]
-    pub fn try_read_buf<B: bytes::BufMut>(&self, buf: &mut B) -> std::io::Result<usize> {
-        match &self.stream {
-            StreamInner::Tcp(s) => s.try_read_buf(buf),
-            StreamInner::Tls(_) | StreamInner::Custom(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "try_read_buf only supported on plain TCP",
-            )),
+            StreamInner::Tcp(s) => Some(s),
+            _ => None,
         }
     }
 }

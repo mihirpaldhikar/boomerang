@@ -50,7 +50,7 @@ fn pick_encoding(header: &str) -> Option<&'static str> {
 pub struct Uninit;
 pub struct Ready;
 
-pub(crate) type ResponseHook = Arc<dyn Fn(HttpStatus) + Send + Sync>;
+pub(crate) type ResponseHook = Arc<dyn Fn(HttpStatus, bool) + Send + Sync>;
 
 pub(crate) struct ResponseParts {
     pub(crate) http_version: Bytes,

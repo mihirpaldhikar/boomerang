@@ -23,7 +23,7 @@ use crate::protocol::{
     Body, BodyError, BodyRef, BodyState, HttpMethod, HttpParam, HttpRequest, HttpRequestError,
     HttpResponse, ResponseHook, Uninit,
 };
-use crate::server::connection::{Connection, WorkerScratch};
+use crate::server::connection::{Connection, Limits, WorkerScratch};
 use crate::server::{RequestId, RestartContext, RestartHandle};
 use bytes::Bytes;
 use std::cell::{Cell, Ref, RefCell};
@@ -43,20 +43,12 @@ impl HttpCall {
     pub(crate) async fn parse(
         mut connection: Connection,
         request_id: RequestId,
-        max_body_size: usize,
-        keep_alive_timeout: std::time::Duration,
-        request_timeout: std::time::Duration,
+        lim: &Limits,
         idle_sleep: std::pin::Pin<&mut tokio::time::Sleep>,
         last_timer_sec: &mut u64,
     ) -> Result<Option<Self>, (Connection, HttpRequestError)> {
         let request = match connection
-            .read_request(
-                max_body_size,
-                keep_alive_timeout,
-                request_timeout,
-                idle_sleep,
-                last_timer_sec,
-            )
+            .read_request(lim, idle_sleep, last_timer_sec)
             .await
         {
             Ok(Some(r)) => r,
@@ -158,7 +150,7 @@ impl HttpCall {
             .header("expect")
             .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
         {
-            let _ = conn.write_all_raw(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+            conn.send_continue().await?;
         }
 
         let max = self.request.max_body_size;
@@ -312,8 +304,6 @@ impl HttpCall {
         if remaining == 0 {
             return Ok(());
         }
-
-        conn.flush_pipeline().await?;
 
         let drain_fut = async {
             while remaining > 0 {
